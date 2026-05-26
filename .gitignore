@@ -1,0 +1,13 @@
+__pycache__/
+*.pyc
+*.pkl
+*.pth
+*.pt
+*.zip
+logs/
+results/
+data/
+datasets/
+checkpoints/
+outputs/
+tmp/
