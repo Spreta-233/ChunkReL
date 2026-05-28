@@ -31,6 +31,9 @@ def make_selection_params(opts):
         'div_feature_layer': opts.div_feature_layer,
         'div_verbose': opts.div_verbose,
         'filter_sim_threshold': opts.filter_sim_threshold,
+        'ccrf_sim_threshold': opts.ccrf_sim_threshold,
+        'gss_grad_sim_threshold': opts.gss_grad_sim_threshold,
+        'gss_grad_layer': opts.gss_grad_layer,
         'filter_feature_source': opts.filter_feature_source,
         'filter_feature_layer': opts.filter_feature_layer,
         'filter_reject_dominated': opts.filter_reject_dominated,
@@ -158,7 +161,8 @@ if __name__ == '__main__':
     parser.add_argument('--buffer_type', type=str, default='coreset')
     parser.add_argument('--ref_sample_per_task', type=int, default=-1)
     parser.add_argument('--memory_allocation', type=str, default='equal', choices=['equal'])
-    parser.add_argument('--selection_strategy', type=str, default='rel', choices=['rel', 'rel_filter', 'rel_diversity'])
+    parser.add_argument('--selection_strategy', type=str, default='rel',
+                        choices=['rel', 'rel_filter', 'rel_diversity', 'rel_ccrf', 'rel_gss_temp'])
     parser.add_argument('--selection_chunk_size', type=int, default=0)
     parser.add_argument('--div_lambda', type=float, default=0.1)
     parser.add_argument('--div_candidate_ratio', type=int, default=3)
@@ -166,6 +170,9 @@ if __name__ == '__main__':
     parser.add_argument('--div_feature_layer', type=str, default='penultimate')
     parser.add_argument('--div_verbose', action='store_true')
     parser.add_argument('--filter_sim_threshold', type=float, default=0.85)
+    parser.add_argument('--ccrf_sim_threshold', type=float, default=0.85)
+    parser.add_argument('--gss_grad_sim_threshold', type=float, default=0.95)
+    parser.add_argument('--gss_grad_layer', type=str, default='classifier')
     parser.add_argument('--filter_feature_source', type=str, default='current_model', choices=['current_model', 'holdout_model'])
     parser.add_argument('--filter_feature_layer', type=str, default='penultimate')
     parser.add_argument('--filter_reject_dominated', action='store_true')
@@ -213,6 +220,9 @@ if __name__ == '__main__':
     print('div feature layer\t\t', args.div_feature_layer)
     print('div verbose\t\t', args.div_verbose)
     print('filter sim threshold\t\t', args.filter_sim_threshold)
+    print('ccrf sim threshold\t\t', args.ccrf_sim_threshold)
+    print('gss grad sim threshold\t\t', args.gss_grad_sim_threshold)
+    print('gss grad layer\t\t', args.gss_grad_layer)
     print('filter feature source\t\t', args.filter_feature_source)
     print('filter feature layer\t\t', args.filter_feature_layer)
     print('filter reject dominated\t\t', args.filter_reject_dominated)

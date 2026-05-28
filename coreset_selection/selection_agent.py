@@ -21,8 +21,9 @@ class RhoSelectionAgent(object):
                  class_balance=True, only_new_data=True, loss_params=None, save_checkpoint=False,
                  selection_strategy='rel', selection_chunk_size=0, div_lambda=0.1, div_candidate_ratio=3,
                  div_feature_source='current_model', div_feature_layer='penultimate', div_verbose=False,
-                 filter_sim_threshold=0.85, filter_feature_source='current_model',
-                 filter_feature_layer='penultimate', filter_reject_dominated=False, filter_verbose=False):
+                 filter_sim_threshold=0.85, ccrf_sim_threshold=0.85, filter_feature_source='current_model',
+                 filter_feature_layer='penultimate', filter_reject_dominated=False, filter_verbose=False,
+                 gss_grad_sim_threshold=0.95, gss_grad_layer='classifier'):
         # all related setting
         self.local_path = local_path
         if not os.path.exists(self.local_path):
@@ -46,6 +47,9 @@ class RhoSelectionAgent(object):
         self.div_feature_layer = div_feature_layer
         self.div_verbose = div_verbose
         self.filter_sim_threshold = filter_sim_threshold
+        self.ccrf_sim_threshold = ccrf_sim_threshold
+        self.gss_grad_sim_threshold = gss_grad_sim_threshold
+        self.gss_grad_layer = gss_grad_layer
         self.filter_feature_source = filter_feature_source
         self.filter_feature_layer = filter_feature_layer
         self.filter_reject_dominated = filter_reject_dominated
@@ -156,7 +160,8 @@ class RhoSelectionAgent(object):
         self.ref_model = trained_model
 
     def incremental_selection(self, x, y, select_size, id_list=None, loss_dic=None, loss_dic_dump_file=None,
-                              verbose=True, class_pool=None, id2logit=None, ideal_logit=False, extra_data=None):
+                              verbose=True, class_pool=None, id2logit=None, ideal_logit=False, extra_data=None,
+                              selected_task_id=None, current_training_task_id=None):
         if select_size >= x.shape[0]:
             print('Warning: select size greater than data size', select_size, x.shape[0])
         # the id of each sample is assigned according to order.
@@ -196,6 +201,10 @@ class RhoSelectionAgent(object):
         # init model and selection
         all_selected_ids = set()
         base_incremental_size = max(int(select_size / self.selection_steps), 1)
+        if selected_task_id is not None and current_training_task_id is not None:
+            ccrf_is_current_task = int(selected_task_id) == int(current_training_task_id)
+        else:
+            ccrf_is_current_task = True
         init_model = utils.build_model(model_params=self.model_params)
         all_class_ids = get_class_dic(y=y)
         class_ids = {}
@@ -238,6 +247,46 @@ class RhoSelectionAgent(object):
             'div_penalty_active': False
         }
         rejected_ids = set()
+        rejection_filter_strategies = ['rel_filter', 'rel_ccrf']
+        ccrf_stats = {
+            'ccrf_enabled': self.selection_strategy == 'rel_ccrf',
+            'ccrf_sim_threshold': self.ccrf_sim_threshold,
+            'ccrf_chunk_size': self.selection_chunk_size,
+            'ccrf_chunks_total': 0,
+            'ccrf_chunks_with_rejection': 0,
+            'ccrf_rejected_total': 0,
+            'ccrf_kept_total': 0,
+            'ccrf_same_class_pair_checked_count': 0,
+            'ccrf_same_class_pair_rejected_count': 0,
+            'ccrf_cross_class_pair_ignored_count': 0,
+            'ccrf_current_task_chunks': 0,
+            'ccrf_historical_task_chunks': 0,
+            'ccrf_historical_fallback_enabled': self.selection_strategy == 'rel_ccrf',
+            'ccrf_historical_fallback_count': 0,
+            'ccrf_effective_chunk_size_current': self.selection_chunk_size if self.selection_chunk_size > 0
+            else base_incremental_size,
+            'ccrf_effective_chunk_size_historical': 1
+        }
+        gss_temp_stats = {
+            'gss_temp_enabled': self.selection_strategy == 'rel_gss_temp',
+            'gss_temp_grad_sim_threshold': self.gss_grad_sim_threshold,
+            'gss_temp_chunk_size': self.selection_chunk_size,
+            'gss_temp_grad_layer': self.gss_grad_layer,
+            'gss_temp_chunks_total': 0,
+            'gss_temp_chunks_with_deferral': 0,
+            'gss_temp_deferred_total': 0,
+            'gss_temp_permanent_rejected_total': 0,
+            'gss_temp_kept_total': 0,
+            'gss_temp_grad_pair_checked_count': 0,
+            'gss_temp_grad_pair_deferred_count': 0,
+            'gss_temp_grad_layer_used': '',
+            'gss_temp_grad_cos_sum': 0.0,
+            'gss_temp_grad_cos_count': 0,
+            'gss_temp_grad_cos_max': 0.0,
+            'gss_temp_current_task_chunks': 0,
+            'gss_temp_historical_task_chunks': 0,
+            'gss_temp_historical_fallback_count': 0
+        }
         # make initial set
         if self.init_size > 0:
             if bool(self.class_balance):
@@ -289,7 +338,14 @@ class RhoSelectionAgent(object):
             init_model = result
         while len(all_selected_ids) < select_size:
             remaining_select_size = select_size - len(all_selected_ids)
-            if self.selection_chunk_size > 0:
+            if self.selection_strategy in ['rel_ccrf', 'rel_gss_temp']:
+                cur_incremental_size = resolve_ccrf_effective_chunk_size(
+                    selection_chunk_size=self.selection_chunk_size,
+                    base_incremental_size=base_incremental_size,
+                    remaining_select_size=remaining_select_size,
+                    is_current_task=ccrf_is_current_task
+                )
+            elif self.selection_chunk_size > 0:
                 cur_incremental_size = min(self.selection_chunk_size, remaining_select_size)
             else:
                 cur_incremental_size = min(base_incremental_size, remaining_select_size)
@@ -297,10 +353,10 @@ class RhoSelectionAgent(object):
             for d_id in full_ids:
                 if bool(self.only_new_data):
                     if d_id not in all_selected_ids:
-                        if self.selection_strategy != 'rel_filter' or d_id not in rejected_ids:
+                        if self.selection_strategy not in rejection_filter_strategies or d_id not in rejected_ids:
                             id_pool.add(d_id)
                 else:
-                    if self.selection_strategy != 'rel_filter' or d_id not in rejected_ids:
+                    if self.selection_strategy not in rejection_filter_strategies or d_id not in rejected_ids:
                         id_pool.add(d_id)
             if len(id_pool) == 0:
                 raise ValueError('No candidate samples remain for selection')
@@ -394,6 +450,80 @@ class RhoSelectionAgent(object):
                         )
                     for d_id in rejected_this_chunk:
                         rejected_ids.add(int(d_id))
+            elif self.selection_strategy == 'rel_ccrf':
+                feature_model = self.ref_model if self.filter_feature_source == 'holdout_model' else init_model
+                if feature_model is None:
+                    feature_model = init_model
+                selected_data, _, rejected_this_chunk, ccrf_chunk_stats = \
+                    coreset_selection_functions.select_by_loss_diff_with_ccrf(
+                        ref_loss_dic=ref_loss_dic,
+                        rand_data=rand_data,
+                        model=init_model,
+                        incremental_size=cur_incremental_size,
+                        transforms=self.transforms,
+                        on_cuda=self.train_params['use_cuda'],
+                        loss_params=self.train_params['loss_params'],
+                        class_sizes=class_sizes,
+                        feature_model=feature_model,
+                        ccrf_sim_threshold=self.ccrf_sim_threshold,
+                        is_current_task=ccrf_is_current_task
+                    )
+                for d_id in rejected_this_chunk:
+                    rejected_ids.add(int(d_id))
+                ccrf_stats['ccrf_chunks_total'] += 1
+                ccrf_stats['ccrf_rejected_total'] += int(ccrf_chunk_stats['rejected_count'])
+                ccrf_stats['ccrf_kept_total'] += int(ccrf_chunk_stats['kept_count'])
+                ccrf_stats['ccrf_same_class_pair_checked_count'] += \
+                    int(ccrf_chunk_stats['same_class_pair_checked_count'])
+                ccrf_stats['ccrf_same_class_pair_rejected_count'] += \
+                    int(ccrf_chunk_stats['same_class_pair_rejected_count'])
+                ccrf_stats['ccrf_cross_class_pair_ignored_count'] += \
+                    int(ccrf_chunk_stats['cross_class_pair_ignored_count'])
+                if ccrf_is_current_task:
+                    ccrf_stats['ccrf_current_task_chunks'] += 1
+                else:
+                    ccrf_stats['ccrf_historical_task_chunks'] += 1
+                    ccrf_stats['ccrf_historical_fallback_count'] += 1
+                if int(ccrf_chunk_stats['rejected_count']) > 0:
+                    ccrf_stats['ccrf_chunks_with_rejection'] += 1
+            elif self.selection_strategy == 'rel_gss_temp':
+                selected_data, _, deferred_this_chunk, gss_chunk_stats = \
+                    coreset_selection_functions.select_by_loss_diff_with_gss_temp(
+                        ref_loss_dic=ref_loss_dic,
+                        rand_data=rand_data,
+                        model=init_model,
+                        incremental_size=cur_incremental_size,
+                        transforms=self.transforms,
+                        on_cuda=self.train_params['use_cuda'],
+                        loss_params=self.train_params['loss_params'],
+                        class_sizes=class_sizes,
+                        gss_grad_sim_threshold=self.gss_grad_sim_threshold,
+                        gss_grad_layer=self.gss_grad_layer,
+                        is_current_task=ccrf_is_current_task
+                    )
+                gss_temp_stats['gss_temp_chunks_total'] += 1
+                gss_temp_stats['gss_temp_deferred_total'] += int(gss_chunk_stats['deferred_count'])
+                gss_temp_stats['gss_temp_kept_total'] += int(gss_chunk_stats['kept_count'])
+                gss_temp_stats['gss_temp_grad_pair_checked_count'] += \
+                    int(gss_chunk_stats['grad_pair_checked_count'])
+                gss_temp_stats['gss_temp_grad_pair_deferred_count'] += \
+                    int(gss_chunk_stats['grad_pair_deferred_count'])
+                if len(str(gss_chunk_stats.get('grad_layer_used', ''))) > 0:
+                    gss_temp_stats['gss_temp_grad_layer_used'] = \
+                        str(gss_chunk_stats.get('grad_layer_used', ''))
+                gss_temp_stats['gss_temp_grad_cos_sum'] += float(gss_chunk_stats['grad_cos_sum'])
+                gss_temp_stats['gss_temp_grad_cos_count'] += int(gss_chunk_stats['grad_cos_count'])
+                gss_temp_stats['gss_temp_grad_cos_max'] = max(
+                    float(gss_temp_stats['gss_temp_grad_cos_max']),
+                    float(gss_chunk_stats['grad_cos_max'])
+                )
+                if ccrf_is_current_task:
+                    gss_temp_stats['gss_temp_current_task_chunks'] += 1
+                else:
+                    gss_temp_stats['gss_temp_historical_task_chunks'] += 1
+                    gss_temp_stats['gss_temp_historical_fallback_count'] += 1
+                if int(gss_chunk_stats['deferred_count']) > 0:
+                    gss_temp_stats['gss_temp_chunks_with_deferral'] += 1
             else:
                 raise ValueError('Invalid selection strategy: ' + str(self.selection_strategy))
             flg_add = False
@@ -482,6 +612,88 @@ class RhoSelectionAgent(object):
             print('[RF-CHECK] rejected_intersection_selected_count=' +
                   str(rejected_intersection_selected_count))
             print('[RF-CHECK] rejected_scope=current_incremental_selection')
+        if self.selection_strategy == 'rel_ccrf':
+            if ccrf_stats['ccrf_chunks_total'] > 0:
+                ccrf_mean_kept_per_chunk = \
+                    float(ccrf_stats['ccrf_kept_total']) / float(ccrf_stats['ccrf_chunks_total'])
+            else:
+                ccrf_mean_kept_per_chunk = 0.0
+            print('[CCRF-SUMMARY] ccrf_enabled=' + str(ccrf_stats['ccrf_enabled']))
+            print('[CCRF-SUMMARY] ccrf_sim_threshold=' + str(ccrf_stats['ccrf_sim_threshold']))
+            print('[CCRF-SUMMARY] ccrf_chunk_size=' + str(ccrf_stats['ccrf_chunk_size']))
+            print('[CCRF-SUMMARY] ccrf_chunks_total=' + str(ccrf_stats['ccrf_chunks_total']))
+            print('[CCRF-SUMMARY] ccrf_chunks_with_rejection=' +
+                  str(ccrf_stats['ccrf_chunks_with_rejection']))
+            print('[CCRF-SUMMARY] ccrf_rejected_total=' + str(ccrf_stats['ccrf_rejected_total']))
+            print('[CCRF-SUMMARY] ccrf_kept_total=' + str(ccrf_stats['ccrf_kept_total']))
+            print('[CCRF-SUMMARY] ccrf_same_class_pair_checked_count=' +
+                  str(ccrf_stats['ccrf_same_class_pair_checked_count']))
+            print('[CCRF-SUMMARY] ccrf_same_class_pair_rejected_count=' +
+                  str(ccrf_stats['ccrf_same_class_pair_rejected_count']))
+            print('[CCRF-SUMMARY] ccrf_cross_class_pair_ignored_count=' +
+                  str(ccrf_stats['ccrf_cross_class_pair_ignored_count']))
+            print('[CCRF-SUMMARY] ccrf_mean_kept_per_chunk=%.6f' % ccrf_mean_kept_per_chunk)
+            print('[CCRF-SUMMARY] ccrf_current_task_chunks=' +
+                  str(ccrf_stats['ccrf_current_task_chunks']))
+            print('[CCRF-SUMMARY] ccrf_historical_task_chunks=' +
+                  str(ccrf_stats['ccrf_historical_task_chunks']))
+            print('[CCRF-SUMMARY] ccrf_historical_fallback_enabled=' +
+                  str(ccrf_stats['ccrf_historical_fallback_enabled']))
+            print('[CCRF-SUMMARY] ccrf_historical_fallback_count=' +
+                  str(ccrf_stats['ccrf_historical_fallback_count']))
+            print('[CCRF-SUMMARY] ccrf_effective_chunk_size_current=' +
+                  str(ccrf_stats['ccrf_effective_chunk_size_current']))
+            print('[CCRF-SUMMARY] ccrf_effective_chunk_size_historical=' +
+                  str(ccrf_stats['ccrf_effective_chunk_size_historical']))
+        if self.selection_strategy == 'rel_gss_temp':
+            if gss_temp_stats['gss_temp_chunks_total'] > 0:
+                gss_temp_mean_kept_per_chunk = \
+                    float(gss_temp_stats['gss_temp_kept_total']) / \
+                    float(gss_temp_stats['gss_temp_chunks_total'])
+            else:
+                gss_temp_mean_kept_per_chunk = 0.0
+            if gss_temp_stats['gss_temp_grad_cos_count'] > 0:
+                gss_temp_grad_cos_mean = \
+                    float(gss_temp_stats['gss_temp_grad_cos_sum']) / \
+                    float(gss_temp_stats['gss_temp_grad_cos_count'])
+            else:
+                gss_temp_grad_cos_mean = 0.0
+            print('[GSS-TEMP-SUMMARY] gss_temp_enabled=' +
+                  str(gss_temp_stats['gss_temp_enabled']))
+            print('[GSS-TEMP-SUMMARY] gss_temp_grad_sim_threshold=' +
+                  str(gss_temp_stats['gss_temp_grad_sim_threshold']))
+            print('[GSS-TEMP-SUMMARY] gss_temp_chunk_size=' +
+                  str(gss_temp_stats['gss_temp_chunk_size']))
+            print('[GSS-TEMP-SUMMARY] gss_temp_grad_layer=' +
+                  str(gss_temp_stats['gss_temp_grad_layer']))
+            print('[GSS-TEMP-SUMMARY] gss_temp_grad_layer_used=' +
+                  str(gss_temp_stats['gss_temp_grad_layer_used']))
+            print('[GSS-TEMP-SUMMARY] gss_temp_chunks_total=' +
+                  str(gss_temp_stats['gss_temp_chunks_total']))
+            print('[GSS-TEMP-SUMMARY] gss_temp_chunks_with_deferral=' +
+                  str(gss_temp_stats['gss_temp_chunks_with_deferral']))
+            print('[GSS-TEMP-SUMMARY] gss_temp_deferred_total=' +
+                  str(gss_temp_stats['gss_temp_deferred_total']))
+            print('[GSS-TEMP-SUMMARY] gss_temp_permanent_rejected_total=' +
+                  str(gss_temp_stats['gss_temp_permanent_rejected_total']))
+            print('[GSS-TEMP-SUMMARY] gss_temp_kept_total=' +
+                  str(gss_temp_stats['gss_temp_kept_total']))
+            print('[GSS-TEMP-SUMMARY] gss_temp_grad_pair_checked_count=' +
+                  str(gss_temp_stats['gss_temp_grad_pair_checked_count']))
+            print('[GSS-TEMP-SUMMARY] gss_temp_grad_pair_deferred_count=' +
+                  str(gss_temp_stats['gss_temp_grad_pair_deferred_count']))
+            print('[GSS-TEMP-SUMMARY] gss_temp_grad_cos_mean=%.6f' %
+                  gss_temp_grad_cos_mean)
+            print('[GSS-TEMP-SUMMARY] gss_temp_grad_cos_max=%.6f' %
+                  float(gss_temp_stats['gss_temp_grad_cos_max']))
+            print('[GSS-TEMP-SUMMARY] gss_temp_mean_kept_per_chunk=%.6f' %
+                  gss_temp_mean_kept_per_chunk)
+            print('[GSS-TEMP-SUMMARY] gss_temp_current_task_chunks=' +
+                  str(gss_temp_stats['gss_temp_current_task_chunks']))
+            print('[GSS-TEMP-SUMMARY] gss_temp_historical_task_chunks=' +
+                  str(gss_temp_stats['gss_temp_historical_task_chunks']))
+            print('[GSS-TEMP-SUMMARY] gss_temp_historical_fallback_count=' +
+                  str(gss_temp_stats['gss_temp_historical_fallback_count']))
         return selected_data
 
     def clear_path(self):
@@ -496,6 +708,15 @@ class RhoSelectionAgent(object):
         dump_file = os.path.join(self.local_path, 'selected_ids_' + str(num_sps) + '.pkl')
         with open(dump_file, 'wb') as fw:
             pickle.dump(selected_ids, fw)
+
+
+def resolve_ccrf_effective_chunk_size(selection_chunk_size, base_incremental_size, remaining_select_size,
+                                      is_current_task):
+    if not is_current_task:
+        return min(1, remaining_select_size)
+    if selection_chunk_size > 0:
+        return min(selection_chunk_size, remaining_select_size)
+    return min(base_incremental_size, remaining_select_size)
 
 
 def get_class_dic(y):

@@ -310,6 +310,358 @@ def _make_selected_data(sorted_ids, rand_data, id2pos, id2logits, loss_params, c
     return selected_data, id2loss_dif
 
 
+def greedy_class_conditional_redundancy_filter(candidate_ids, candidate_labels, features, sim_threshold):
+    if not torch.is_tensor(features):
+        features = torch.tensor(features, dtype=torch.float32)
+    features = features.clone().detach().float()
+    if features.dim() != 2:
+        raise ValueError('features must be a 2D tensor')
+    if len(candidate_ids) != len(candidate_labels) or len(candidate_ids) != features.size(0):
+        raise ValueError('candidate_ids, candidate_labels, and features must have the same length')
+    features = torch.nn.functional.normalize(features, p=2, dim=1, eps=1e-12)
+    sims = torch.mm(features, features.t()) if len(candidate_ids) > 0 else None
+    kept_pos = []
+    rejected_ids = []
+    stats = {
+        'same_class_pair_checked_count': 0,
+        'same_class_pair_rejected_count': 0,
+        'cross_class_pair_ignored_count': 0,
+        'kept_count': 0,
+        'rejected_count': 0
+    }
+    for i, d_id in enumerate(candidate_ids):
+        duplicate = False
+        for selected_pos in kept_pos:
+            if int(candidate_labels[i]) == int(candidate_labels[selected_pos]):
+                stats['same_class_pair_checked_count'] += 1
+                sim_value = float(sims[i, selected_pos])
+                if sim_value >= sim_threshold:
+                    stats['same_class_pair_rejected_count'] += 1
+                    duplicate = True
+                    break
+            else:
+                stats['cross_class_pair_ignored_count'] += 1
+        if duplicate:
+            rejected_ids.append(int(d_id))
+        else:
+            kept_pos.append(i)
+    if len(kept_pos) == 0 and len(candidate_ids) > 0:
+        kept_pos = [0]
+        first_id = int(candidate_ids[0])
+        rejected_ids = [d_id for d_id in rejected_ids if int(d_id) != first_id]
+    kept_ids = [int(candidate_ids[i]) for i in kept_pos]
+    stats['kept_count'] = len(kept_ids)
+    stats['rejected_count'] = len(rejected_ids)
+    return kept_ids, rejected_ids, stats
+
+
+def apply_ccrf_chunk_filter(candidate_ids, candidate_labels, features, sim_threshold, is_current_task=True):
+    if not is_current_task:
+        kept_ids = [int(candidate_ids[0])] if len(candidate_ids) > 0 else []
+        return kept_ids, [], {
+            'same_class_pair_checked_count': 0,
+            'same_class_pair_rejected_count': 0,
+            'cross_class_pair_ignored_count': 0,
+            'kept_count': len(kept_ids),
+            'rejected_count': 0
+        }
+    return greedy_class_conditional_redundancy_filter(
+        candidate_ids=candidate_ids,
+        candidate_labels=candidate_labels,
+        features=features,
+        sim_threshold=sim_threshold
+    )
+
+
+def _as_logits(model_out):
+    if isinstance(model_out, tuple):
+        return model_out[0]
+    if isinstance(model_out, list):
+        return model_out[0]
+    return model_out
+
+
+def _named_module_params(model, module_name):
+    if not hasattr(model, module_name):
+        return []
+    module = getattr(model, module_name)
+    if hasattr(module, 'parameters') and callable(module.parameters):
+        return [p for p in module.parameters() if p.requires_grad]
+    return []
+
+
+def _get_gss_gradient_params(model, gss_grad_layer):
+    layer_name = str(gss_grad_layer).lower()
+    if layer_name in ['all', 'full', 'all_params']:
+        params = [p for p in model.parameters() if p.requires_grad]
+        return params, 'all'
+    preferred_names = [str(gss_grad_layer)]
+    if layer_name == 'classifier':
+        preferred_names = ['classifier', 'fc', 'linear', 'head']
+    elif layer_name in ['last', 'last_layer', 'output']:
+        preferred_names = ['classifier', 'fc', 'linear', 'head']
+    for name in preferred_names:
+        params = _named_module_params(model, name)
+        if len(params) > 0:
+            return params, name
+    params = [p for p in model.parameters() if p.requires_grad]
+    return params, 'all'
+
+
+def _extract_gss_candidate_gradients(rand_data, candidate_ids, id2pos, model, transforms, on_cuda,
+                                     gss_grad_layer='classifier'):
+    status = model.training
+    model.eval()
+    if on_cuda:
+        model.cuda()
+    torch_rng_state = torch.get_rng_state()
+    cuda_rng_state = torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None
+    np_rng_state = np.random.get_state()
+    random_rng_state = random.getstate()
+    loss_fn = torch.nn.CrossEntropyLoss()
+    params, grad_layer_used = _get_gss_gradient_params(model, gss_grad_layer)
+    grad_dim = sum([p.numel() for p in params])
+    gradients = []
+    try:
+        for d_id in candidate_ids:
+            di = rand_data[id2pos[d_id]]
+            sp = di[1]
+            lab = int(di[2])
+            if transforms is not None:
+                aug_sp = torch.unsqueeze(transforms(sp), dim=0)
+            else:
+                aug_sp = torch.unsqueeze(sp, dim=0)
+            labs = torch.tensor([lab], dtype=torch.long)
+            if on_cuda:
+                aug_sp = aug_sp.cuda()
+                labs = labs.cuda()
+            model.zero_grad()
+            logits = _as_logits(model(aug_sp))
+            loss = loss_fn(logits, labs)
+            loss.backward()
+            grad_parts = []
+            for param in params:
+                if param.grad is not None:
+                    grad_parts.append(param.grad.detach().view(-1).cpu())
+            if len(grad_parts) == 0:
+                grad_vec = torch.zeros(max(grad_dim, 1), dtype=torch.float32)
+            else:
+                grad_vec = torch.cat(grad_parts, dim=0).float()
+            gradients.append(grad_vec)
+            model.zero_grad()
+    finally:
+        model.zero_grad()
+        torch.set_rng_state(torch_rng_state)
+        if cuda_rng_state is not None:
+            torch.cuda.set_rng_state_all(cuda_rng_state)
+        np.random.set_state(np_rng_state)
+        random.setstate(random_rng_state)
+        if on_cuda:
+            model.cpu()
+        model.train(status)
+    gradients = torch.stack(gradients, dim=0)
+    gradients = torch.nn.functional.normalize(gradients, p=2, dim=1, eps=1e-12)
+    return gradients, grad_layer_used
+
+
+def apply_gss_temp_chunk_filter(candidate_ids, gradients, sim_threshold, is_current_task=True):
+    stats = {
+        'grad_pair_checked_count': 0,
+        'grad_pair_deferred_count': 0,
+        'grad_cos_sum': 0.0,
+        'grad_cos_count': 0,
+        'grad_cos_max': 0.0,
+        'kept_count': 0,
+        'deferred_count': 0,
+        'permanent_rejected_count': 0
+    }
+    if not is_current_task:
+        kept_ids = [int(candidate_ids[0])] if len(candidate_ids) > 0 else []
+        stats['kept_count'] = len(kept_ids)
+        return kept_ids, [], [], stats
+    if not torch.is_tensor(gradients):
+        gradients = torch.tensor(gradients, dtype=torch.float32)
+    gradients = gradients.clone().detach().float()
+    if gradients.dim() != 2:
+        raise ValueError('gradients must be a 2D tensor')
+    if len(candidate_ids) != gradients.size(0):
+        raise ValueError('candidate_ids and gradients must have the same length')
+    gradients = torch.nn.functional.normalize(gradients, p=2, dim=1, eps=1e-12)
+    sims = torch.mm(gradients, gradients.t()) if len(candidate_ids) > 0 else None
+    kept_pos = []
+    deferred_ids = []
+    for i, d_id in enumerate(candidate_ids):
+        duplicate = False
+        for selected_pos in kept_pos:
+            sim_value = float(sims[i, selected_pos])
+            stats['grad_pair_checked_count'] += 1
+            stats['grad_cos_sum'] += sim_value
+            stats['grad_cos_count'] += 1
+            stats['grad_cos_max'] = max(float(stats['grad_cos_max']), sim_value)
+            if sim_value >= sim_threshold:
+                stats['grad_pair_deferred_count'] += 1
+                duplicate = True
+                break
+        if duplicate:
+            deferred_ids.append(int(d_id))
+        else:
+            kept_pos.append(i)
+    if len(kept_pos) == 0 and len(candidate_ids) > 0:
+        kept_pos = [0]
+        first_id = int(candidate_ids[0])
+        deferred_ids = [d_id for d_id in deferred_ids if int(d_id) != first_id]
+    kept_ids = [int(candidate_ids[i]) for i in kept_pos]
+    stats['kept_count'] = len(kept_ids)
+    stats['deferred_count'] = len(deferred_ids)
+    return kept_ids, deferred_ids, [], stats
+
+
+def select_by_loss_diff_with_ccrf(ref_loss_dic, rand_data, model, incremental_size, transforms, on_cuda,
+                                  loss_params, class_sizes=None, feature_model=None, ccrf_sim_threshold=0.85,
+                                  is_current_task=True):
+    loss_diffs, id2pos, id2logits = _loss_diff_for_candidates(
+        ref_loss_dic=ref_loss_dic,
+        rand_data=rand_data,
+        model=model,
+        transforms=transforms,
+        on_cuda=on_cuda,
+        loss_params=loss_params
+    )
+    sorted_loss_diffs = sorted(loss_diffs.items(), key=lambda x: x[1], reverse=True)
+    top_items = sorted_loss_diffs[:incremental_size]
+    candidate_ids = [int(x[0]) for x in top_items]
+    candidate_labels = [int(rand_data[id2pos[d_id]][2]) for d_id in candidate_ids]
+    if feature_model is None:
+        feature_model = model
+    if len(candidate_ids) > 0 and is_current_task:
+        features, _ = _extract_candidate_features(
+            rand_data=rand_data,
+            candidate_ids=candidate_ids,
+            id2pos=id2pos,
+            model=feature_model,
+            transforms=transforms,
+            on_cuda=on_cuda
+        )
+        kept_ids, rejected_ids, ccrf_stats = apply_ccrf_chunk_filter(
+            candidate_ids=candidate_ids,
+            candidate_labels=candidate_labels,
+            features=features,
+            sim_threshold=ccrf_sim_threshold,
+            is_current_task=True
+        )
+    elif len(candidate_ids) > 0:
+        kept_ids, rejected_ids, ccrf_stats = apply_ccrf_chunk_filter(
+            candidate_ids=candidate_ids,
+            candidate_labels=candidate_labels,
+            features=None,
+            sim_threshold=ccrf_sim_threshold,
+            is_current_task=False
+        )
+    else:
+        kept_ids = []
+        rejected_ids = []
+        ccrf_stats = {
+            'same_class_pair_checked_count': 0,
+            'same_class_pair_rejected_count': 0,
+            'cross_class_pair_ignored_count': 0,
+            'kept_count': 0,
+            'rejected_count': 0
+        }
+    rel_by_id = {}
+    for d_id, loss_dif in top_items:
+        rel_by_id[int(d_id)] = float(loss_dif)
+    selected_items = [(d_id, rel_by_id[int(d_id)]) for d_id in kept_ids]
+    selected_data, id2loss_dif = _make_selected_data(
+        sorted_ids=selected_items,
+        rand_data=rand_data,
+        id2pos=id2pos,
+        id2logits=id2logits,
+        loss_params=loss_params,
+        class_sizes=class_sizes,
+        incremental_size=len(selected_items)
+    )
+    selected_ids = set([int(di[0]) for di in selected_data])
+    rejected_ids = [int(d_id) for d_id in rejected_ids if int(d_id) not in selected_ids]
+    ccrf_stats['rejected_count'] = len(rejected_ids)
+    ccrf_stats['kept_count'] = len(kept_ids)
+    return selected_data, id2loss_dif, rejected_ids, ccrf_stats
+
+
+def select_by_loss_diff_with_gss_temp(ref_loss_dic, rand_data, model, incremental_size, transforms, on_cuda,
+                                      loss_params, class_sizes=None, gss_grad_sim_threshold=0.95,
+                                      gss_grad_layer='classifier', is_current_task=True):
+    loss_diffs, id2pos, id2logits = _loss_diff_for_candidates(
+        ref_loss_dic=ref_loss_dic,
+        rand_data=rand_data,
+        model=model,
+        transforms=transforms,
+        on_cuda=on_cuda,
+        loss_params=loss_params
+    )
+    sorted_loss_diffs = sorted(loss_diffs.items(), key=lambda x: x[1], reverse=True)
+    top_items = sorted_loss_diffs[:incremental_size]
+    candidate_ids = [int(x[0]) for x in top_items]
+    if len(candidate_ids) > 0 and is_current_task:
+        gradients, grad_layer_used = _extract_gss_candidate_gradients(
+            rand_data=rand_data,
+            candidate_ids=candidate_ids,
+            id2pos=id2pos,
+            model=model,
+            transforms=transforms,
+            on_cuda=on_cuda,
+            gss_grad_layer=gss_grad_layer
+        )
+        kept_ids, deferred_ids, permanent_rejected_ids, gss_stats = apply_gss_temp_chunk_filter(
+            candidate_ids=candidate_ids,
+            gradients=gradients,
+            sim_threshold=gss_grad_sim_threshold,
+            is_current_task=True
+        )
+        gss_stats['grad_layer_used'] = grad_layer_used
+    elif len(candidate_ids) > 0:
+        kept_ids, deferred_ids, permanent_rejected_ids, gss_stats = apply_gss_temp_chunk_filter(
+            candidate_ids=candidate_ids,
+            gradients=None,
+            sim_threshold=gss_grad_sim_threshold,
+            is_current_task=False
+        )
+        gss_stats['grad_layer_used'] = 'not_used_historical'
+    else:
+        kept_ids = []
+        deferred_ids = []
+        permanent_rejected_ids = []
+        gss_stats = {
+            'grad_pair_checked_count': 0,
+            'grad_pair_deferred_count': 0,
+            'grad_cos_sum': 0.0,
+            'grad_cos_count': 0,
+            'grad_cos_max': 0.0,
+            'kept_count': 0,
+            'deferred_count': 0,
+            'permanent_rejected_count': 0,
+            'grad_layer_used': 'not_used_empty'
+        }
+    rel_by_id = {}
+    for d_id, loss_dif in top_items:
+        rel_by_id[int(d_id)] = float(loss_dif)
+    selected_items = [(d_id, rel_by_id[int(d_id)]) for d_id in kept_ids]
+    selected_data, id2loss_dif = _make_selected_data(
+        sorted_ids=selected_items,
+        rand_data=rand_data,
+        id2pos=id2pos,
+        id2logits=id2logits,
+        loss_params=loss_params,
+        class_sizes=class_sizes,
+        incremental_size=len(selected_items)
+    )
+    selected_ids = set([int(di[0]) for di in selected_data])
+    deferred_ids = [int(d_id) for d_id in deferred_ids if int(d_id) not in selected_ids]
+    gss_stats['kept_count'] = len(selected_data)
+    gss_stats['deferred_count'] = len(deferred_ids)
+    gss_stats['permanent_rejected_count'] = len(permanent_rejected_ids)
+    return selected_data, id2loss_dif, deferred_ids, gss_stats
+
+
 def select_by_loss_diff_with_diversity(ref_loss_dic, rand_data, model, incremental_size, transforms, on_cuda,
                                        loss_params, class_sizes=None, feature_model=None, div_lambda=0.1,
                                        div_candidate_ratio=3, div_feature_source='current_model',

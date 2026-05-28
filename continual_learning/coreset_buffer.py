@@ -54,6 +54,9 @@ class CoresetBuffer(object):
             div_feature_layer=self.selection_params.get('div_feature_layer', 'penultimate'),
             div_verbose=self.selection_params.get('div_verbose', False),
             filter_sim_threshold=self.selection_params.get('filter_sim_threshold', 0.85),
+            ccrf_sim_threshold=self.selection_params.get('ccrf_sim_threshold', 0.85),
+            gss_grad_sim_threshold=self.selection_params.get('gss_grad_sim_threshold', 0.95),
+            gss_grad_layer=self.selection_params.get('gss_grad_layer', 'classifier'),
             filter_feature_source=self.selection_params.get('filter_feature_source', 'current_model'),
             filter_feature_layer=self.selection_params.get('filter_feature_layer', 'penultimate'),
             filter_reject_dominated=self.selection_params.get('filter_reject_dominated', False),
@@ -141,7 +144,9 @@ class CoresetBuffer(object):
                 class_pool=self.task_dic[i],
                 id_list=id_pool,
                 id2logit=id2logit,
-                extra_data=extra_data
+                extra_data=extra_data,
+                selected_task_id=i,
+                current_training_task_id=task_id
             )
             self.coreset_selector.clear_path()
             # update data and id2task
@@ -191,7 +196,9 @@ class CoresetBuffer(object):
             class_pool=self.task_dic[task_id],
             id_list=cur_id_list,
             id2logit=new_id2logit,
-            extra_data=extra_data
+            extra_data=extra_data,
+            selected_task_id=task_id,
+            current_training_task_id=task_id
         )
         self.coreset_selector.clear_path()
         self.id_bias += cur_x.shape[0]
