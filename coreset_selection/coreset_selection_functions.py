@@ -310,6 +310,245 @@ def _make_selected_data(sorted_ids, rand_data, id2pos, id2logits, loss_params, c
     return selected_data, id2loss_dif
 
 
+def make_gss_anchor_replace_stats():
+    return {
+        'gss_anchor_replace_chunks_total': 0,
+        'gss_anchor_replace_final_kept_total': 0,
+        'gss_anchor_replace_tail_candidates_total': 0,
+        'gss_anchor_replace_replaced_total': 0,
+        'gss_anchor_replace_skip_similar_total': 0,
+        'gss_anchor_replace_similarity_sum': 0.0,
+        'gss_anchor_replace_similarity_count': 0,
+        'gss_anchor_replace_similarity_max': 0.0,
+        'gss_anchor_replace_rel_gap_sum': 0.0,
+        'gss_anchor_replace_rel_gap_count': 0,
+        'gss_anchor_replace_current_task_chunks': 0,
+        'gss_anchor_replace_historical_task_chunks': 0,
+        'gss_anchor_replace_historical_fallback_count': 0,
+        'gss_anchor_replace_grad_layer_used': ''
+    }
+
+
+def gss_anchor_replace_uses_anchor(selection_strategy, is_current_task):
+    return selection_strategy == 'rel_gss_anchor_replace' and bool(is_current_task)
+
+
+def gss_anchor_replace_resolve_chunk_size(selection_strategy, is_current_task, selection_chunk_size,
+                                          base_incremental_size, remaining_select_size):
+    if selection_strategy == 'rel_gss_anchor_replace' and not bool(is_current_task):
+        return 1
+    if selection_chunk_size > 0:
+        return min(selection_chunk_size, remaining_select_size)
+    return min(base_incremental_size, remaining_select_size)
+
+
+def _add_gss_anchor_replace_stat(stats, key, value):
+    if stats is not None:
+        stats[key] = stats.get(key, 0) + value
+
+
+def _set_gss_anchor_replace_stat(stats, key, value):
+    if stats is not None:
+        stats[key] = value
+
+
+def _normalize_grad_vector(grad):
+    grad = grad.view(-1).float()
+    return torch.nn.functional.normalize(grad, p=2, dim=0, eps=1e-12)
+
+
+def _resolve_grad_parameters(model, grad_layer):
+    requested_layer = str(grad_layer)
+    direct_names = [requested_layer]
+    if requested_layer == 'classifier':
+        direct_names = ['classifier', 'linear', 'fc', 'fc3', 'fc2', 'head']
+    for module_name in direct_names:
+        if hasattr(model, module_name):
+            module = getattr(model, module_name)
+            params = [(module_name + '.' + name, param)
+                      for name, param in module.named_parameters(recurse=True)
+                      if param.requires_grad]
+            if len(params) > 0:
+                return params, module_name
+    for module_name, module in model.named_modules():
+        if module_name == requested_layer:
+            params = [(module_name + '.' + name, param)
+                      for name, param in module.named_parameters(recurse=True)
+                      if param.requires_grad]
+            if len(params) > 0:
+                return params, module_name
+    params = []
+    for name, param in model.named_parameters():
+        if param.requires_grad and (name == requested_layer or name.startswith(requested_layer + '.')):
+            params.append((name, param))
+    if len(params) > 0:
+        return params, requested_layer
+    if requested_layer == 'classifier':
+        classifier_tokens = ['classifier', 'linear', 'fc', 'head']
+        for name, param in model.named_parameters():
+            if not param.requires_grad:
+                continue
+            if any(token in name for token in classifier_tokens):
+                params.append((name, param))
+        if len(params) > 0:
+            return params, 'classifier_auto'
+    params = [(name, param) for name, param in model.named_parameters() if param.requires_grad]
+    return params, 'all'
+
+
+def _extract_candidate_gradients(rand_data, candidate_ids, id2pos, model, transforms, on_cuda, loss_params,
+                                 grad_layer):
+    status = model.training
+    model.eval()
+    if on_cuda:
+        model.cuda()
+    grad_params, grad_layer_used = _resolve_grad_parameters(model=model, grad_layer=grad_layer)
+    loss_fn = loss_functions.CompliedLoss(
+        ce_factor=loss_params['ce_factor'], mse_factor=loss_params['mse_factor'], reduction='mean')
+    torch_rng_state = torch.get_rng_state()
+    cuda_rng_state = torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None
+    np_rng_state = np.random.get_state()
+    random_rng_state = random.getstate()
+    gradients_by_id = {}
+    try:
+        for d_id in candidate_ids:
+            di = rand_data[id2pos[d_id]]
+            if len(di) == 4:
+                _, sp, lab, logit = di
+            else:
+                _, sp, lab = di
+                logit = None
+            if transforms is not None:
+                sps = torch.unsqueeze(transforms(sp), dim=0)
+            else:
+                sps = torch.unsqueeze(sp, dim=0)
+            labs = torch.tensor([int(lab)], dtype=torch.long)
+            if logit is not None:
+                lab_logits = torch.unsqueeze(torch.tensor(logit, dtype=torch.float32), dim=0)
+            else:
+                lab_logits = None
+            if on_cuda:
+                sps = sps.cuda()
+                labs = labs.cuda()
+                if lab_logits is not None:
+                    lab_logits = lab_logits.cuda()
+            model.zero_grad()
+            loss = loss_fn(x=model(sps), y=labs, logits=lab_logits)
+            if hasattr(loss, 'dim') and loss.dim() > 0:
+                loss = loss.mean()
+            loss.backward()
+            grad_parts = []
+            for _, param in grad_params:
+                if param.grad is None:
+                    grad_parts.append(torch.zeros(param.numel(), dtype=torch.float32))
+                else:
+                    grad_parts.append(param.grad.detach().view(-1).cpu().float())
+            if len(grad_parts) == 0:
+                gradients_by_id[int(d_id)] = torch.zeros(1, dtype=torch.float32)
+            else:
+                gradients_by_id[int(d_id)] = torch.cat(grad_parts, dim=0)
+            model.zero_grad()
+    finally:
+        torch.set_rng_state(torch_rng_state)
+        if cuda_rng_state is not None:
+            torch.cuda.set_rng_state_all(cuda_rng_state)
+        np.random.set_state(np_rng_state)
+        random.setstate(random_rng_state)
+        if on_cuda:
+            model.cpu()
+        model.train(status)
+    return gradients_by_id, grad_layer_used
+
+
+def select_anchor_replace_ranked_items(sorted_loss_diffs, gradients_by_id, window_size=8, anchor_size=4,
+                                       sim_threshold=0.90, stats=None):
+    window_size = max(int(window_size), 1)
+    anchor_size = max(int(anchor_size), 1)
+    anchor_size = min(anchor_size, len(sorted_loss_diffs))
+    window_size = max(window_size, anchor_size)
+    window_items = list(sorted_loss_diffs[:min(window_size, len(sorted_loss_diffs))])
+    selected_items = list(window_items[:anchor_size])
+    tail_items = list(window_items[anchor_size:])
+    _add_gss_anchor_replace_stat(stats, 'gss_anchor_replace_chunks_total', 1)
+    _add_gss_anchor_replace_stat(stats, 'gss_anchor_replace_current_task_chunks', 1)
+    _add_gss_anchor_replace_stat(stats, 'gss_anchor_replace_tail_candidates_total', len(tail_items))
+    for candidate_item in tail_items:
+        cand_id, cand_rel = candidate_item
+        cand_grad = gradients_by_id[int(cand_id)]
+        sim_values = []
+        for selected_item in selected_items:
+            selected_id = int(selected_item[0])
+            selected_grad = gradients_by_id[selected_id]
+            sim_value = float(torch.dot(_normalize_grad_vector(cand_grad), _normalize_grad_vector(selected_grad)))
+            sim_values.append(sim_value)
+        sim_max = max(sim_values) if len(sim_values) > 0 else 0.0
+        _add_gss_anchor_replace_stat(stats, 'gss_anchor_replace_similarity_sum', sim_max)
+        _add_gss_anchor_replace_stat(stats, 'gss_anchor_replace_similarity_count', 1)
+        if stats is not None:
+            stats['gss_anchor_replace_similarity_max'] = max(
+                stats.get('gss_anchor_replace_similarity_max', 0.0), sim_max)
+        if sim_max >= float(sim_threshold):
+            _add_gss_anchor_replace_stat(stats, 'gss_anchor_replace_skip_similar_total', 1)
+            continue
+        replace_pos = min(range(len(selected_items)), key=lambda idx: float(selected_items[idx][1]))
+        replace_target = selected_items[replace_pos]
+        selected_items[replace_pos] = candidate_item
+        _add_gss_anchor_replace_stat(stats, 'gss_anchor_replace_replaced_total', 1)
+        _add_gss_anchor_replace_stat(
+            stats, 'gss_anchor_replace_rel_gap_sum', float(replace_target[1]) - float(cand_rel))
+        _add_gss_anchor_replace_stat(stats, 'gss_anchor_replace_rel_gap_count', 1)
+    _add_gss_anchor_replace_stat(stats, 'gss_anchor_replace_final_kept_total', len(selected_items))
+    return selected_items
+
+
+def select_by_loss_diff_with_anchor_replace(ref_loss_dic, rand_data, model, incremental_size, transforms, on_cuda,
+                                            loss_params, class_sizes=None, window_size=8, anchor_size=4,
+                                            sim_threshold=0.90, grad_layer='classifier', stats=None):
+    loss_diffs, id2pos, id2logits = _loss_diff_for_candidates(
+        ref_loss_dic=ref_loss_dic,
+        rand_data=rand_data,
+        model=model,
+        transforms=transforms,
+        on_cuda=on_cuda,
+        loss_params=loss_params
+    )
+    sorted_loss_diffs = sorted(loss_diffs.items(), key=lambda x: x[1], reverse=True)
+    anchor_size = min(int(anchor_size), int(incremental_size), len(sorted_loss_diffs))
+    window_size = max(int(window_size), anchor_size)
+    window_items = sorted_loss_diffs[:min(window_size, len(sorted_loss_diffs))]
+    candidate_ids = [x[0] for x in window_items]
+    gradients_by_id, grad_layer_used = _extract_candidate_gradients(
+        rand_data=rand_data,
+        candidate_ids=candidate_ids,
+        id2pos=id2pos,
+        model=model,
+        transforms=transforms,
+        on_cuda=on_cuda,
+        loss_params=loss_params,
+        grad_layer=grad_layer
+    )
+    _set_gss_anchor_replace_stat(stats, 'gss_anchor_replace_grad_layer_used', grad_layer_used)
+    selected_items = select_anchor_replace_ranked_items(
+        sorted_loss_diffs=sorted_loss_diffs,
+        gradients_by_id=gradients_by_id,
+        window_size=window_size,
+        anchor_size=anchor_size,
+        sim_threshold=sim_threshold,
+        stats=stats
+    )
+    selected_data, id2loss_dif = _make_selected_data(
+        sorted_ids=selected_items,
+        rand_data=rand_data,
+        id2pos=id2pos,
+        id2logits=id2logits,
+        loss_params=loss_params,
+        class_sizes=class_sizes,
+        incremental_size=len(selected_items)
+    )
+    _print_selected_data_checks(selected_data, len(selected_items))
+    return selected_data, id2loss_dif
+
+
 def select_by_loss_diff_with_diversity(ref_loss_dic, rand_data, model, incremental_size, transforms, on_cuda,
                                        loss_params, class_sizes=None, feature_model=None, div_lambda=0.1,
                                        div_candidate_ratio=3, div_feature_source='current_model',

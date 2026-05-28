@@ -25,6 +25,10 @@ def make_selection_params(opts):
         },
         'selection_strategy': opts.selection_strategy,
         'selection_chunk_size': opts.selection_chunk_size,
+        'gss_anchor_replace_window': opts.gss_anchor_replace_window,
+        'gss_anchor_replace_anchor_size': opts.gss_anchor_replace_anchor_size,
+        'gss_anchor_replace_sim_threshold': opts.gss_anchor_replace_sim_threshold,
+        'gss_grad_layer': opts.gss_grad_layer,
         'div_lambda': opts.div_lambda,
         'div_candidate_ratio': opts.div_candidate_ratio,
         'div_feature_source': opts.div_feature_source,
@@ -158,8 +162,13 @@ if __name__ == '__main__':
     parser.add_argument('--buffer_type', type=str, default='coreset')
     parser.add_argument('--ref_sample_per_task', type=int, default=-1)
     parser.add_argument('--memory_allocation', type=str, default='equal', choices=['equal'])
-    parser.add_argument('--selection_strategy', type=str, default='rel', choices=['rel', 'rel_filter', 'rel_diversity'])
+    parser.add_argument('--selection_strategy', type=str, default='rel',
+                        choices=['rel', 'rel_filter', 'rel_diversity', 'rel_gss_anchor_replace'])
     parser.add_argument('--selection_chunk_size', type=int, default=0)
+    parser.add_argument('--gss_anchor_replace_window', type=int, default=8)
+    parser.add_argument('--gss_anchor_replace_anchor_size', type=int, default=4)
+    parser.add_argument('--gss_anchor_replace_sim_threshold', type=float, default=0.90)
+    parser.add_argument('--gss_grad_layer', type=str, default='classifier')
     parser.add_argument('--div_lambda', type=float, default=0.1)
     parser.add_argument('--div_candidate_ratio', type=int, default=3)
     parser.add_argument('--div_feature_source', type=str, default='current_model', choices=['current_model', 'holdout_model'])
@@ -207,6 +216,10 @@ if __name__ == '__main__':
     print('memory allocation\t\t', args.memory_allocation)
     print('selection strategy\t\t', args.selection_strategy)
     print('selection chunk size\t\t', args.selection_chunk_size)
+    print('gss anchor replace window\t\t', args.gss_anchor_replace_window)
+    print('gss anchor replace anchor size\t\t', args.gss_anchor_replace_anchor_size)
+    print('gss anchor replace sim threshold\t\t', args.gss_anchor_replace_sim_threshold)
+    print('gss grad layer\t\t', args.gss_grad_layer)
     print('div lambda\t\t', args.div_lambda)
     print('div candidate ratio\t\t', args.div_candidate_ratio)
     print('div feature source\t\t', args.div_feature_source)
