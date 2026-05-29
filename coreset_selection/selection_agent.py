@@ -336,7 +336,9 @@ class RhoSelectionAgent(object):
             )
             if self.selection_strategy == 'rel' or \
                     (self.selection_strategy == 'rel_gss_anchor_replace' and
-                     not gss_anchor_replace_is_current_task):
+                     not gss_anchor_replace_is_current_task) or \
+                    coreset_selection_functions.gss_anchor_replace_uses_historical_rel_top4(
+                        self.selection_strategy, gss_anchor_replace_is_current_task):
                 if self.selection_strategy == 'rel_gss_anchor_replace':
                     self.gss_anchor_replace_stats['gss_anchor_replace_historical_task_chunks'] += 1
                     self.gss_anchor_replace_stats['gss_anchor_replace_historical_fallback_count'] += 1
@@ -350,6 +352,10 @@ class RhoSelectionAgent(object):
                     loss_params=self.train_params['loss_params'],
                     class_sizes=class_sizes
                 )
+                if coreset_selection_functions.gss_anchor_replace_uses_historical_rel_top4(
+                        self.selection_strategy, gss_anchor_replace_is_current_task):
+                    coreset_selection_functions.record_gss_anchor_replace_historical_top4(
+                        self.gss_anchor_replace_stats, len(selected_data))
             elif coreset_selection_functions.gss_anchor_replace_uses_anchor(
                     self.selection_strategy, gss_anchor_replace_is_current_task):
                 selected_data, _ = coreset_selection_functions.select_by_loss_diff_with_anchor_replace(
@@ -540,6 +546,7 @@ class RhoSelectionAgent(object):
         historical_task_chunks = int(stats.get('gss_anchor_replace_historical_task_chunks', 0))
         current_anchor_replace_count = int(stats.get('gss_anchor_replace_current_anchor_replace_count', 0))
         historical_anchor_replace_count = int(stats.get('gss_anchor_replace_historical_anchor_replace_count', 0))
+        historical_top4_count = int(stats.get('gss_anchor_replace_historical_top4_count', 0))
         historical_fallback_count = int(stats.get('gss_anchor_replace_historical_fallback_count', 0))
         final_mean = final_kept_total / max(chunks_total, 1)
         mean_replace = replaced_total / max(chunks_total, 1)
@@ -593,6 +600,8 @@ class RhoSelectionAgent(object):
               str(current_anchor_replace_count))
         print('[GSS-ANCHOR-REPLACE-SUMMARY] gss_anchor_replace_historical_anchor_replace_count=' +
               str(historical_anchor_replace_count))
+        print('[GSS-ANCHOR-REPLACE-SUMMARY] gss_anchor_replace_historical_top4_count=' +
+              str(historical_top4_count))
         print('[GSS-ANCHOR-REPLACE-SUMMARY] gss_anchor_replace_historical_fallback_count=' +
               str(historical_fallback_count))
         print('[GSS-ANCHOR-REPLACE-SUMMARY] current_task_chunks=' + str(current_task_chunks))
@@ -601,6 +610,8 @@ class RhoSelectionAgent(object):
               str(current_anchor_replace_count))
         print('[GSS-ANCHOR-REPLACE-SUMMARY] historical_anchor_replace_count=' +
               str(historical_anchor_replace_count))
+        print('[GSS-ANCHOR-REPLACE-SUMMARY] historical_top4_count=' +
+              str(historical_top4_count))
         print('[GSS-ANCHOR-REPLACE-SUMMARY] historical_fallback_count=' +
               str(historical_fallback_count))
         print('[GSS-ANCHOR-REPLACE-SUMMARY] final_mean_kept_per_chunk=%.6f' %

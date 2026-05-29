@@ -72,7 +72,9 @@ class CoresetBuffer(object):
     def update_buffer(self, task_cnts, task_id, cur_x, cur_y, full_cur_x, full_cur_y, cur_id2logit=None,
                       next_x=None, next_y=None):
         if self.selection_params.get('selection_strategy', 'rel') in [
-                'rel_gss_anchor_replace', 'rel_gss_anchor_replace_all_tasks']:
+                'rel_gss_anchor_replace',
+                'rel_gss_anchor_replace_all_tasks',
+                'rel_gss_anchor_replace_hist_top4']:
             self.coreset_selector.reset_gss_anchor_replace_summary()
         # distribute buffer size to each task
         task_sizes = []

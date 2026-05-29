@@ -326,19 +326,31 @@ def make_gss_anchor_replace_stats():
         'gss_anchor_replace_historical_task_chunks': 0,
         'gss_anchor_replace_current_anchor_replace_count': 0,
         'gss_anchor_replace_historical_anchor_replace_count': 0,
+        'gss_anchor_replace_historical_top4_count': 0,
         'gss_anchor_replace_historical_fallback_count': 0,
         'gss_anchor_replace_grad_layer_used': ''
     }
 
 
 def gss_anchor_replace_is_strategy(selection_strategy):
-    return selection_strategy in ['rel_gss_anchor_replace', 'rel_gss_anchor_replace_all_tasks']
+    return selection_strategy in [
+        'rel_gss_anchor_replace',
+        'rel_gss_anchor_replace_all_tasks',
+        'rel_gss_anchor_replace_hist_top4'
+    ]
 
 
 def gss_anchor_replace_uses_anchor(selection_strategy, is_current_task):
     if selection_strategy == 'rel_gss_anchor_replace_all_tasks':
         return True
-    return selection_strategy == 'rel_gss_anchor_replace' and bool(is_current_task)
+    return selection_strategy in [
+        'rel_gss_anchor_replace',
+        'rel_gss_anchor_replace_hist_top4'
+    ] and bool(is_current_task)
+
+
+def gss_anchor_replace_uses_historical_rel_top4(selection_strategy, is_current_task):
+    return selection_strategy == 'rel_gss_anchor_replace_hist_top4' and not bool(is_current_task)
 
 
 def gss_anchor_replace_resolve_chunk_size(selection_strategy, is_current_task, selection_chunk_size,
@@ -358,6 +370,13 @@ def _add_gss_anchor_replace_stat(stats, key, value):
 def _set_gss_anchor_replace_stat(stats, key, value):
     if stats is not None:
         stats[key] = value
+
+
+def record_gss_anchor_replace_historical_top4(stats, final_kept):
+    _add_gss_anchor_replace_stat(stats, 'gss_anchor_replace_chunks_total', 1)
+    _add_gss_anchor_replace_stat(stats, 'gss_anchor_replace_historical_task_chunks', 1)
+    _add_gss_anchor_replace_stat(stats, 'gss_anchor_replace_historical_top4_count', 1)
+    _add_gss_anchor_replace_stat(stats, 'gss_anchor_replace_final_kept_total', int(final_kept))
 
 
 def _normalize_grad_vector(grad):
