@@ -350,7 +350,8 @@ class RhoSelectionAgent(object):
                     loss_params=self.train_params['loss_params'],
                     class_sizes=class_sizes
                 )
-            elif self.selection_strategy == 'rel_gss_anchor_replace':
+            elif coreset_selection_functions.gss_anchor_replace_uses_anchor(
+                    self.selection_strategy, gss_anchor_replace_is_current_task):
                 selected_data, _ = coreset_selection_functions.select_by_loss_diff_with_anchor_replace(
                     ref_loss_dic=ref_loss_dic,
                     rand_data=rand_data,
@@ -364,7 +365,8 @@ class RhoSelectionAgent(object):
                     anchor_size=self.gss_anchor_replace_anchor_size,
                     sim_threshold=self.gss_anchor_replace_sim_threshold,
                     grad_layer=self.gss_grad_layer,
-                    stats=self.gss_anchor_replace_stats
+                    stats=self.gss_anchor_replace_stats,
+                    is_current_task=gss_anchor_replace_is_current_task
                 )
             elif self.selection_strategy == 'rel_diversity':
                 feature_model = self.ref_model if self.div_feature_source == 'holdout_model' else init_model
@@ -514,7 +516,8 @@ class RhoSelectionAgent(object):
             print('[RF-CHECK] rejected_intersection_selected_count=' +
                   str(rejected_intersection_selected_count))
             print('[RF-CHECK] rejected_scope=current_incremental_selection')
-        if self.selection_strategy == 'rel_gss_anchor_replace' and gss_anchor_replace_is_current_task:
+        if coreset_selection_functions.gss_anchor_replace_is_strategy(self.selection_strategy) and \
+                gss_anchor_replace_is_current_task:
             self.print_gss_anchor_replace_summary()
         return selected_data
 
@@ -533,6 +536,11 @@ class RhoSelectionAgent(object):
         similarity_max = float(stats.get('gss_anchor_replace_similarity_max', 0.0))
         rel_gap_sum = float(stats.get('gss_anchor_replace_rel_gap_sum', 0.0))
         rel_gap_count = int(stats.get('gss_anchor_replace_rel_gap_count', 0))
+        current_task_chunks = int(stats.get('gss_anchor_replace_current_task_chunks', 0))
+        historical_task_chunks = int(stats.get('gss_anchor_replace_historical_task_chunks', 0))
+        current_anchor_replace_count = int(stats.get('gss_anchor_replace_current_anchor_replace_count', 0))
+        historical_anchor_replace_count = int(stats.get('gss_anchor_replace_historical_anchor_replace_count', 0))
+        historical_fallback_count = int(stats.get('gss_anchor_replace_historical_fallback_count', 0))
         final_mean = final_kept_total / max(chunks_total, 1)
         mean_replace = replaced_total / max(chunks_total, 1)
         similarity_mean = similarity_sum / max(similarity_count, 1)
@@ -578,11 +586,30 @@ class RhoSelectionAgent(object):
               float(rel_gap_mean))
         print('[GSS-ANCHOR-REPLACE-SUMMARY] gss_anchor_replace_permanent_rejected_total=0')
         print('[GSS-ANCHOR-REPLACE-SUMMARY] gss_anchor_replace_current_task_chunks=' +
-              str(stats.get('gss_anchor_replace_current_task_chunks', 0)))
+              str(current_task_chunks))
         print('[GSS-ANCHOR-REPLACE-SUMMARY] gss_anchor_replace_historical_task_chunks=' +
-              str(stats.get('gss_anchor_replace_historical_task_chunks', 0)))
+              str(historical_task_chunks))
+        print('[GSS-ANCHOR-REPLACE-SUMMARY] gss_anchor_replace_current_anchor_replace_count=' +
+              str(current_anchor_replace_count))
+        print('[GSS-ANCHOR-REPLACE-SUMMARY] gss_anchor_replace_historical_anchor_replace_count=' +
+              str(historical_anchor_replace_count))
         print('[GSS-ANCHOR-REPLACE-SUMMARY] gss_anchor_replace_historical_fallback_count=' +
-              str(stats.get('gss_anchor_replace_historical_fallback_count', 0)))
+              str(historical_fallback_count))
+        print('[GSS-ANCHOR-REPLACE-SUMMARY] current_task_chunks=' + str(current_task_chunks))
+        print('[GSS-ANCHOR-REPLACE-SUMMARY] historical_task_chunks=' + str(historical_task_chunks))
+        print('[GSS-ANCHOR-REPLACE-SUMMARY] current_anchor_replace_count=' +
+              str(current_anchor_replace_count))
+        print('[GSS-ANCHOR-REPLACE-SUMMARY] historical_anchor_replace_count=' +
+              str(historical_anchor_replace_count))
+        print('[GSS-ANCHOR-REPLACE-SUMMARY] historical_fallback_count=' +
+              str(historical_fallback_count))
+        print('[GSS-ANCHOR-REPLACE-SUMMARY] final_mean_kept_per_chunk=%.6f' %
+              float(final_mean))
+        print('[GSS-ANCHOR-REPLACE-SUMMARY] replaced_total=' + str(replaced_total))
+        print('[GSS-ANCHOR-REPLACE-SUMMARY] skip_similar_total=' + str(skip_total))
+        print('[GSS-ANCHOR-REPLACE-SUMMARY] mean_replace_per_chunk=%.6f' %
+              float(mean_replace))
+        print('[GSS-ANCHOR-REPLACE-SUMMARY] permanent_rejected_total=0')
 
     def clear_path(self):
         if os.path.exists(self.cur_train_file):

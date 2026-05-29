@@ -324,12 +324,20 @@ def make_gss_anchor_replace_stats():
         'gss_anchor_replace_rel_gap_count': 0,
         'gss_anchor_replace_current_task_chunks': 0,
         'gss_anchor_replace_historical_task_chunks': 0,
+        'gss_anchor_replace_current_anchor_replace_count': 0,
+        'gss_anchor_replace_historical_anchor_replace_count': 0,
         'gss_anchor_replace_historical_fallback_count': 0,
         'gss_anchor_replace_grad_layer_used': ''
     }
 
 
+def gss_anchor_replace_is_strategy(selection_strategy):
+    return selection_strategy in ['rel_gss_anchor_replace', 'rel_gss_anchor_replace_all_tasks']
+
+
 def gss_anchor_replace_uses_anchor(selection_strategy, is_current_task):
+    if selection_strategy == 'rel_gss_anchor_replace_all_tasks':
+        return True
     return selection_strategy == 'rel_gss_anchor_replace' and bool(is_current_task)
 
 
@@ -461,7 +469,7 @@ def _extract_candidate_gradients(rand_data, candidate_ids, id2pos, model, transf
 
 
 def select_anchor_replace_ranked_items(sorted_loss_diffs, gradients_by_id, window_size=8, anchor_size=4,
-                                       sim_threshold=0.90, stats=None):
+                                       sim_threshold=0.90, stats=None, is_current_task=True):
     window_size = max(int(window_size), 1)
     anchor_size = max(int(anchor_size), 1)
     anchor_size = min(anchor_size, len(sorted_loss_diffs))
@@ -470,7 +478,12 @@ def select_anchor_replace_ranked_items(sorted_loss_diffs, gradients_by_id, windo
     selected_items = list(window_items[:anchor_size])
     tail_items = list(window_items[anchor_size:])
     _add_gss_anchor_replace_stat(stats, 'gss_anchor_replace_chunks_total', 1)
-    _add_gss_anchor_replace_stat(stats, 'gss_anchor_replace_current_task_chunks', 1)
+    if bool(is_current_task):
+        _add_gss_anchor_replace_stat(stats, 'gss_anchor_replace_current_task_chunks', 1)
+        _add_gss_anchor_replace_stat(stats, 'gss_anchor_replace_current_anchor_replace_count', 1)
+    else:
+        _add_gss_anchor_replace_stat(stats, 'gss_anchor_replace_historical_task_chunks', 1)
+        _add_gss_anchor_replace_stat(stats, 'gss_anchor_replace_historical_anchor_replace_count', 1)
     _add_gss_anchor_replace_stat(stats, 'gss_anchor_replace_tail_candidates_total', len(tail_items))
     for candidate_item in tail_items:
         cand_id, cand_rel = candidate_item
@@ -503,7 +516,8 @@ def select_anchor_replace_ranked_items(sorted_loss_diffs, gradients_by_id, windo
 
 def select_by_loss_diff_with_anchor_replace(ref_loss_dic, rand_data, model, incremental_size, transforms, on_cuda,
                                             loss_params, class_sizes=None, window_size=8, anchor_size=4,
-                                            sim_threshold=0.90, grad_layer='classifier', stats=None):
+                                            sim_threshold=0.90, grad_layer='classifier', stats=None,
+                                            is_current_task=True):
     loss_diffs, id2pos, id2logits = _loss_diff_for_candidates(
         ref_loss_dic=ref_loss_dic,
         rand_data=rand_data,
@@ -534,7 +548,8 @@ def select_by_loss_diff_with_anchor_replace(ref_loss_dic, rand_data, model, incr
         window_size=window_size,
         anchor_size=anchor_size,
         sim_threshold=sim_threshold,
-        stats=stats
+        stats=stats,
+        is_current_task=is_current_task
     )
     selected_data, id2loss_dif = _make_selected_data(
         sorted_ids=selected_items,

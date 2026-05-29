@@ -163,7 +163,8 @@ if __name__ == '__main__':
     parser.add_argument('--ref_sample_per_task', type=int, default=-1)
     parser.add_argument('--memory_allocation', type=str, default='equal', choices=['equal'])
     parser.add_argument('--selection_strategy', type=str, default='rel',
-                        choices=['rel', 'rel_filter', 'rel_diversity', 'rel_gss_anchor_replace'])
+                        choices=['rel', 'rel_filter', 'rel_diversity', 'rel_gss_anchor_replace',
+                                 'rel_gss_anchor_replace_all_tasks'])
     parser.add_argument('--selection_chunk_size', type=int, default=0)
     parser.add_argument('--gss_anchor_replace_window', type=int, default=8)
     parser.add_argument('--gss_anchor_replace_anchor_size', type=int, default=4)
