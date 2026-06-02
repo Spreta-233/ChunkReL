@@ -57,7 +57,15 @@ class CoresetBuffer(object):
             filter_feature_source=self.selection_params.get('filter_feature_source', 'current_model'),
             filter_feature_layer=self.selection_params.get('filter_feature_layer', 'penultimate'),
             filter_reject_dominated=self.selection_params.get('filter_reject_dominated', False),
-            filter_verbose=self.selection_params.get('filter_verbose', False)
+            filter_verbose=self.selection_params.get('filter_verbose', False),
+            gss_anchor_replace_window=self.selection_params.get('gss_anchor_replace_window', 8),
+            gss_anchor_replace_anchor_size=self.selection_params.get('gss_anchor_replace_anchor_size', 4),
+            gss_anchor_replace_sim_threshold=self.selection_params.get('gss_anchor_replace_sim_threshold', 0.90),
+            gss_grad_layer=self.selection_params.get('gss_grad_layer', 'classifier'),
+            gss_anchor_replace_prob_seed_offset=self.selection_params.get(
+                'gss_anchor_replace_prob_seed_offset', 0),
+            gss_anchor_replace_prob_conservativeness=self.selection_params.get(
+                'gss_anchor_replace_prob_conservativeness', 1.0)
         )
         self.data = []
         self.id2task = {}
@@ -67,6 +75,14 @@ class CoresetBuffer(object):
 
     def update_buffer(self, task_cnts, task_id, cur_x, cur_y, full_cur_x, full_cur_y, cur_id2logit=None,
                       next_x=None, next_y=None):
+        if self.selection_params.get('selection_strategy', 'rel') in [
+                'rel_gss_anchor_replace',
+                'rel_gss_anchor_replace_all_tasks',
+                'rel_gss_anchor_replace_hist_top4',
+                'rel_gss_anchor_replace_hist_top4_prob']:
+            self.coreset_selector.reset_gss_anchor_replace_summary()
+        if self.selection_params.get('selection_strategy', 'rel') == 'rel_gss_iqp_hist_top4':
+            self.coreset_selector.reset_gss_iqp_summary()
         # distribute buffer size to each task
         task_sizes = []
         for i in range(task_id + 1):
@@ -141,7 +157,8 @@ class CoresetBuffer(object):
                 class_pool=self.task_dic[i],
                 id_list=id_pool,
                 id2logit=id2logit,
-                extra_data=extra_data
+                extra_data=extra_data,
+                gss_anchor_replace_is_current_task=False
             )
             self.coreset_selector.clear_path()
             # update data and id2task
@@ -191,7 +208,8 @@ class CoresetBuffer(object):
             class_pool=self.task_dic[task_id],
             id_list=cur_id_list,
             id2logit=new_id2logit,
-            extra_data=extra_data
+            extra_data=extra_data,
+            gss_anchor_replace_is_current_task=True
         )
         self.coreset_selector.clear_path()
         self.id_bias += cur_x.shape[0]

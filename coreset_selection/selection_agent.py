@@ -7,6 +7,7 @@ import pickle
 import os
 import random
 import copy
+import numpy as np
 
 import utils
 from dataset import single_task_dataset
@@ -21,8 +22,12 @@ class RhoSelectionAgent(object):
                  class_balance=True, only_new_data=True, loss_params=None, save_checkpoint=False,
                  selection_strategy='rel', selection_chunk_size=0, div_lambda=0.1, div_candidate_ratio=3,
                  div_feature_source='current_model', div_feature_layer='penultimate', div_verbose=False,
-                 filter_sim_threshold=0.85, filter_feature_source='current_model',
-                 filter_feature_layer='penultimate', filter_reject_dominated=False, filter_verbose=False):
+                  filter_sim_threshold=0.85, filter_feature_source='current_model',
+                  filter_feature_layer='penultimate', filter_reject_dominated=False, filter_verbose=False,
+                  gss_anchor_replace_window=8, gss_anchor_replace_anchor_size=4,
+                  gss_anchor_replace_sim_threshold=0.90, gss_grad_layer='classifier',
+                  gss_anchor_replace_prob_seed_offset=0,
+                  gss_anchor_replace_prob_conservativeness=1.0):
         # all related setting
         self.local_path = local_path
         if not os.path.exists(self.local_path):
@@ -50,6 +55,17 @@ class RhoSelectionAgent(object):
         self.filter_feature_layer = filter_feature_layer
         self.filter_reject_dominated = filter_reject_dominated
         self.filter_verbose = filter_verbose
+        self.gss_anchor_replace_window = gss_anchor_replace_window
+        self.gss_anchor_replace_anchor_size = gss_anchor_replace_anchor_size
+        self.gss_anchor_replace_sim_threshold = gss_anchor_replace_sim_threshold
+        self.gss_grad_layer = gss_grad_layer
+        self.gss_anchor_replace_prob_seed_offset = gss_anchor_replace_prob_seed_offset
+        self.gss_anchor_replace_prob_conservativeness = float(gss_anchor_replace_prob_conservativeness)
+        base_prob_seed = 0 if seed is None else int(seed)
+        prob_seed = (base_prob_seed + int(gss_anchor_replace_prob_seed_offset)) % (2 ** 32)
+        self.gss_anchor_replace_prob_rng = np.random.RandomState(prob_seed)
+        self.gss_anchor_replace_stats = coreset_selection_functions.make_gss_anchor_replace_stats()
+        self.gss_iqp_stats = coreset_selection_functions.make_gss_iqp_stats()
         self.ref_model = ref_model
         self.ref_train_params = ref_train_params
         self.model_params = model_params
@@ -156,7 +172,8 @@ class RhoSelectionAgent(object):
         self.ref_model = trained_model
 
     def incremental_selection(self, x, y, select_size, id_list=None, loss_dic=None, loss_dic_dump_file=None,
-                              verbose=True, class_pool=None, id2logit=None, ideal_logit=False, extra_data=None):
+                              verbose=True, class_pool=None, id2logit=None, ideal_logit=False, extra_data=None,
+                              gss_anchor_replace_is_current_task=True):
         if select_size >= x.shape[0]:
             print('Warning: select size greater than data size', select_size, x.shape[0])
         # the id of each sample is assigned according to order.
@@ -289,10 +306,13 @@ class RhoSelectionAgent(object):
             init_model = result
         while len(all_selected_ids) < select_size:
             remaining_select_size = select_size - len(all_selected_ids)
-            if self.selection_chunk_size > 0:
-                cur_incremental_size = min(self.selection_chunk_size, remaining_select_size)
-            else:
-                cur_incremental_size = min(base_incremental_size, remaining_select_size)
+            cur_incremental_size = coreset_selection_functions.gss_anchor_replace_resolve_chunk_size(
+                selection_strategy=self.selection_strategy,
+                is_current_task=gss_anchor_replace_is_current_task,
+                selection_chunk_size=self.selection_chunk_size,
+                base_incremental_size=base_incremental_size,
+                remaining_select_size=remaining_select_size
+            )
             id_pool = set()
             for d_id in full_ids:
                 if bool(self.only_new_data):
@@ -323,7 +343,16 @@ class RhoSelectionAgent(object):
                 id_list=id_list,
                 id2logit=id2logit
             )
-            if self.selection_strategy == 'rel':
+            if self.selection_strategy == 'rel' or \
+                    (self.selection_strategy == 'rel_gss_anchor_replace' and
+                     not gss_anchor_replace_is_current_task) or \
+                    coreset_selection_functions.gss_anchor_replace_uses_historical_rel_top4(
+                        self.selection_strategy, gss_anchor_replace_is_current_task) or \
+                    coreset_selection_functions.gss_iqp_uses_historical_rel_top4(
+                        self.selection_strategy, gss_anchor_replace_is_current_task):
+                if self.selection_strategy == 'rel_gss_anchor_replace':
+                    self.gss_anchor_replace_stats['gss_anchor_replace_historical_task_chunks'] += 1
+                    self.gss_anchor_replace_stats['gss_anchor_replace_historical_fallback_count'] += 1
                 selected_data, _ = coreset_selection_functions.select_by_loss_diff(
                     ref_loss_dic=ref_loss_dic,
                     rand_data=rand_data,
@@ -333,6 +362,54 @@ class RhoSelectionAgent(object):
                     on_cuda=self.train_params['use_cuda'],
                     loss_params=self.train_params['loss_params'],
                     class_sizes=class_sizes
+                )
+                if coreset_selection_functions.gss_anchor_replace_uses_historical_rel_top4(
+                        self.selection_strategy, gss_anchor_replace_is_current_task):
+                    coreset_selection_functions.record_gss_anchor_replace_historical_top4(
+                        self.gss_anchor_replace_stats, len(selected_data))
+                if coreset_selection_functions.gss_iqp_uses_historical_rel_top4(
+                        self.selection_strategy, gss_anchor_replace_is_current_task):
+                    coreset_selection_functions.record_gss_iqp_historical_top4(
+                        self.gss_iqp_stats, len(selected_data))
+            elif coreset_selection_functions.gss_anchor_replace_uses_anchor(
+                    self.selection_strategy, gss_anchor_replace_is_current_task):
+                selected_data, _ = coreset_selection_functions.select_by_loss_diff_with_anchor_replace(
+                    ref_loss_dic=ref_loss_dic,
+                    rand_data=rand_data,
+                    model=init_model,
+                    incremental_size=cur_incremental_size,
+                    transforms=self.transforms,
+                    on_cuda=self.train_params['use_cuda'],
+                    loss_params=self.train_params['loss_params'],
+                    class_sizes=class_sizes,
+                    window_size=self.gss_anchor_replace_window,
+                    anchor_size=self.gss_anchor_replace_anchor_size,
+                    sim_threshold=self.gss_anchor_replace_sim_threshold,
+                    grad_layer=self.gss_grad_layer,
+                    stats=self.gss_anchor_replace_stats,
+                    is_current_task=gss_anchor_replace_is_current_task,
+                    probabilistic_replace=(
+                        coreset_selection_functions.gss_anchor_replace_uses_prob_replace(
+                            self.selection_strategy)),
+                    prob_rng=self.gss_anchor_replace_prob_rng,
+                    prob_conservativeness=self.gss_anchor_replace_prob_conservativeness
+                )
+            elif coreset_selection_functions.gss_iqp_uses_iqp(
+                    self.selection_strategy, gss_anchor_replace_is_current_task):
+                selected_data, _ = coreset_selection_functions.select_by_loss_diff_with_gss_iqp(
+                    ref_loss_dic=ref_loss_dic,
+                    rand_data=rand_data,
+                    model=init_model,
+                    incremental_size=cur_incremental_size,
+                    transforms=self.transforms,
+                    on_cuda=self.train_params['use_cuda'],
+                    loss_params=self.train_params['loss_params'],
+                    class_sizes=class_sizes,
+                    window_size=self.gss_anchor_replace_window,
+                    select_size=self.gss_anchor_replace_anchor_size,
+                    grad_layer=self.gss_grad_layer,
+                    stats=self.gss_iqp_stats,
+                    is_current_task=gss_anchor_replace_is_current_task
                 )
             elif self.selection_strategy == 'rel_diversity':
                 feature_model = self.ref_model if self.div_feature_source == 'holdout_model' else init_model
@@ -482,7 +559,210 @@ class RhoSelectionAgent(object):
             print('[RF-CHECK] rejected_intersection_selected_count=' +
                   str(rejected_intersection_selected_count))
             print('[RF-CHECK] rejected_scope=current_incremental_selection')
+        if coreset_selection_functions.gss_anchor_replace_is_strategy(self.selection_strategy) and \
+                gss_anchor_replace_is_current_task:
+            self.print_gss_anchor_replace_summary()
+        if coreset_selection_functions.gss_iqp_is_strategy(self.selection_strategy) and \
+                gss_anchor_replace_is_current_task:
+            self.print_gss_iqp_summary()
         return selected_data
+
+    def reset_gss_anchor_replace_summary(self):
+        self.gss_anchor_replace_stats = coreset_selection_functions.make_gss_anchor_replace_stats()
+
+    def reset_gss_iqp_summary(self):
+        self.gss_iqp_stats = coreset_selection_functions.make_gss_iqp_stats()
+
+    def print_gss_iqp_summary(self):
+        stats = self.gss_iqp_stats
+        chunks_total = int(stats.get('gss_iqp_chunks_total', 0))
+        final_kept_total = int(stats.get('gss_iqp_final_kept_total', 0))
+        current_iqp_chunks = int(stats.get('gss_iqp_current_iqp_chunks', 0))
+        historical_top4_count = int(stats.get('gss_iqp_historical_top4_count', 0))
+        historical_iqp_count = int(stats.get('gss_iqp_historical_iqp_count', 0))
+        iqp_changed_chunks = int(stats.get('gss_iqp_changed_chunks', 0))
+        iqp_changed_samples = int(stats.get('gss_iqp_changed_samples', 0))
+        pairwise_rel_sum = float(stats.get('gss_iqp_pairwise_cos_rel_top4_sum', 0.0))
+        pairwise_iqp_sum = float(stats.get('gss_iqp_pairwise_cos_iqp_selected_sum', 0.0))
+        rel_top4_sum = float(stats.get('gss_iqp_rel_sum_rel_top4_sum', 0.0))
+        rel_iqp_sum = float(stats.get('gss_iqp_rel_sum_iqp_selected_sum', 0.0))
+        mean_pairwise_rel = pairwise_rel_sum / max(current_iqp_chunks, 1)
+        mean_pairwise_iqp = pairwise_iqp_sum / max(current_iqp_chunks, 1)
+        mean_rel_top4 = rel_top4_sum / max(current_iqp_chunks, 1)
+        mean_rel_iqp = rel_iqp_sum / max(current_iqp_chunks, 1)
+        final_mean = final_kept_total / max(chunks_total, 1)
+        print('[GSS-IQP-SUMMARY] GSS-IQP-SUMMARY')
+        print('[GSS-IQP-SUMMARY] block_id=' + str(int(stats.get('gss_iqp_block_id', 0))))
+        print('[GSS-IQP-SUMMARY] current_iqp_chunks=' + str(current_iqp_chunks))
+        print('[GSS-IQP-SUMMARY] historical_top4_count=' + str(historical_top4_count))
+        print('[GSS-IQP-SUMMARY] historical_iqp_count=' + str(historical_iqp_count))
+        print('[GSS-IQP-SUMMARY] iqp_changed_chunks=' + str(iqp_changed_chunks))
+        print('[GSS-IQP-SUMMARY] iqp_changed_samples=' + str(iqp_changed_samples))
+        print('[GSS-IQP-SUMMARY] mean_pairwise_cos_rel_top4=%.6f' % float(mean_pairwise_rel))
+        print('[GSS-IQP-SUMMARY] mean_pairwise_cos_iqp_selected=%.6f' % float(mean_pairwise_iqp))
+        print('[GSS-IQP-SUMMARY] mean_pairwise_cos_delta=%.6f' %
+              float(mean_pairwise_iqp - mean_pairwise_rel))
+        print('[GSS-IQP-SUMMARY] mean_rel_sum_rel_top4=%.6f' % float(mean_rel_top4))
+        print('[GSS-IQP-SUMMARY] mean_rel_sum_iqp_selected=%.6f' % float(mean_rel_iqp))
+        print('[GSS-IQP-SUMMARY] mean_rel_sum_drop=%.6f' % float(mean_rel_top4 - mean_rel_iqp))
+        print('[GSS-IQP-SUMMARY] final_mean_kept_per_chunk=%.6f' % float(final_mean))
+        print('[GSS-IQP-SUMMARY] permanent_rejected_total=0')
+
+    def print_gss_anchor_replace_summary(self):
+        stats = self.gss_anchor_replace_stats
+        chunks_total = int(stats.get('gss_anchor_replace_chunks_total', 0))
+        final_kept_total = int(stats.get('gss_anchor_replace_final_kept_total', 0))
+        tail_total = int(stats.get('gss_anchor_replace_tail_candidates_total', 0))
+        replaced_total = int(stats.get('gss_anchor_replace_replaced_total', 0))
+        skip_total = int(stats.get('gss_anchor_replace_skip_similar_total', 0))
+        similarity_sum = float(stats.get('gss_anchor_replace_similarity_sum', 0.0))
+        similarity_count = int(stats.get('gss_anchor_replace_similarity_count', 0))
+        similarity_max = float(stats.get('gss_anchor_replace_similarity_max', 0.0))
+        rel_gap_sum = float(stats.get('gss_anchor_replace_rel_gap_sum', 0.0))
+        rel_gap_count = int(stats.get('gss_anchor_replace_rel_gap_count', 0))
+        current_task_chunks = int(stats.get('gss_anchor_replace_current_task_chunks', 0))
+        historical_task_chunks = int(stats.get('gss_anchor_replace_historical_task_chunks', 0))
+        current_anchor_replace_count = int(stats.get('gss_anchor_replace_current_anchor_replace_count', 0))
+        historical_anchor_replace_count = int(stats.get('gss_anchor_replace_historical_anchor_replace_count', 0))
+        historical_top4_count = int(stats.get('gss_anchor_replace_historical_top4_count', 0))
+        historical_fallback_count = int(stats.get('gss_anchor_replace_historical_fallback_count', 0))
+        final_mean = final_kept_total / max(chunks_total, 1)
+        mean_replace = replaced_total / max(chunks_total, 1)
+        similarity_mean = similarity_sum / max(similarity_count, 1)
+        rel_gap_mean = rel_gap_sum / max(rel_gap_count, 1)
+        print('[GSS-ANCHOR-REPLACE-SUMMARY] gss_anchor_replace_enabled=True')
+        print('[GSS-ANCHOR-REPLACE-SUMMARY] gss_anchor_replace_window=' +
+              str(self.gss_anchor_replace_window))
+        print('[GSS-ANCHOR-REPLACE-SUMMARY] gss_anchor_replace_anchor_size=' +
+              str(self.gss_anchor_replace_anchor_size))
+        print('[GSS-ANCHOR-REPLACE-SUMMARY] gss_anchor_replace_sim_threshold=%.6f' %
+              float(self.gss_anchor_replace_sim_threshold))
+        print('[GSS-ANCHOR-REPLACE-SUMMARY] gss_anchor_replace_grad_layer=' +
+              str(self.gss_grad_layer))
+        print('[GSS-ANCHOR-REPLACE-SUMMARY] gss_anchor_replace_grad_layer_used=' +
+              str(stats.get('gss_anchor_replace_grad_layer_used', '')))
+        print('[GSS-ANCHOR-REPLACE-SUMMARY] gss_anchor_replace_chunks_total=' +
+              str(chunks_total))
+        print('[GSS-ANCHOR-REPLACE-SUMMARY] gss_anchor_replace_final_kept_total=' +
+              str(final_kept_total))
+        print('[GSS-ANCHOR-REPLACE-SUMMARY] gss_anchor_replace_final_mean_kept_per_chunk=%.6f' %
+              float(final_mean))
+        print('[GSS-ANCHOR-REPLACE-SUMMARY] gss_anchor_replace_tail_candidates_total=' +
+              str(tail_total))
+        print('[GSS-ANCHOR-REPLACE-SUMMARY] gss_anchor_replace_replaced_total=' +
+              str(replaced_total))
+        print('[GSS-ANCHOR-REPLACE-SUMMARY] gss_anchor_replace_skip_similar_total=' +
+              str(skip_total))
+        print('[GSS-ANCHOR-REPLACE-SUMMARY] gss_anchor_replace_mean_replace_per_chunk=%.6f' %
+              float(mean_replace))
+        print('[GSS-ANCHOR-REPLACE-SUMMARY] gss_anchor_replace_similarity_sum=%.6f' %
+              float(similarity_sum))
+        print('[GSS-ANCHOR-REPLACE-SUMMARY] gss_anchor_replace_similarity_count=' +
+              str(similarity_count))
+        print('[GSS-ANCHOR-REPLACE-SUMMARY] gss_anchor_replace_similarity_mean=%.6f' %
+              float(similarity_mean))
+        print('[GSS-ANCHOR-REPLACE-SUMMARY] gss_anchor_replace_similarity_max=%.6f' %
+              float(similarity_max))
+        print('[GSS-ANCHOR-REPLACE-SUMMARY] gss_anchor_replace_rel_gap_sum=%.6f' %
+              float(rel_gap_sum))
+        print('[GSS-ANCHOR-REPLACE-SUMMARY] gss_anchor_replace_rel_gap_count=' +
+              str(rel_gap_count))
+        print('[GSS-ANCHOR-REPLACE-SUMMARY] gss_anchor_replace_rel_gap_mean=%.6f' %
+              float(rel_gap_mean))
+        print('[GSS-ANCHOR-REPLACE-SUMMARY] gss_anchor_replace_permanent_rejected_total=0')
+        print('[GSS-ANCHOR-REPLACE-SUMMARY] gss_anchor_replace_current_task_chunks=' +
+              str(current_task_chunks))
+        print('[GSS-ANCHOR-REPLACE-SUMMARY] gss_anchor_replace_historical_task_chunks=' +
+              str(historical_task_chunks))
+        print('[GSS-ANCHOR-REPLACE-SUMMARY] gss_anchor_replace_current_anchor_replace_count=' +
+              str(current_anchor_replace_count))
+        print('[GSS-ANCHOR-REPLACE-SUMMARY] gss_anchor_replace_historical_anchor_replace_count=' +
+              str(historical_anchor_replace_count))
+        print('[GSS-ANCHOR-REPLACE-SUMMARY] gss_anchor_replace_historical_top4_count=' +
+              str(historical_top4_count))
+        print('[GSS-ANCHOR-REPLACE-SUMMARY] gss_anchor_replace_historical_fallback_count=' +
+              str(historical_fallback_count))
+        print('[GSS-ANCHOR-REPLACE-SUMMARY] current_task_chunks=' + str(current_task_chunks))
+        print('[GSS-ANCHOR-REPLACE-SUMMARY] historical_task_chunks=' + str(historical_task_chunks))
+        print('[GSS-ANCHOR-REPLACE-SUMMARY] current_anchor_replace_count=' +
+              str(current_anchor_replace_count))
+        print('[GSS-ANCHOR-REPLACE-SUMMARY] historical_anchor_replace_count=' +
+              str(historical_anchor_replace_count))
+        print('[GSS-ANCHOR-REPLACE-SUMMARY] historical_top4_count=' +
+              str(historical_top4_count))
+        print('[GSS-ANCHOR-REPLACE-SUMMARY] historical_fallback_count=' +
+              str(historical_fallback_count))
+        print('[GSS-ANCHOR-REPLACE-SUMMARY] final_mean_kept_per_chunk=%.6f' %
+              float(final_mean))
+        print('[GSS-ANCHOR-REPLACE-SUMMARY] replaced_total=' + str(replaced_total))
+        print('[GSS-ANCHOR-REPLACE-SUMMARY] skip_similar_total=' + str(skip_total))
+        print('[GSS-ANCHOR-REPLACE-SUMMARY] mean_replace_per_chunk=%.6f' %
+              float(mean_replace))
+        print('[GSS-ANCHOR-REPLACE-SUMMARY] permanent_rejected_total=0')
+        if coreset_selection_functions.gss_anchor_replace_uses_prob_replace(self.selection_strategy):
+            self.print_gss_anchor_replace_prob_summary()
+
+    def print_gss_anchor_replace_prob_summary(self):
+        stats = self.gss_anchor_replace_stats
+        candidate_total = int(stats.get('gss_anchor_replace_prob_candidate_total', 0))
+        accept_total = int(stats.get('gss_anchor_replace_prob_accept_total', 0))
+        reject_total = int(stats.get('gss_anchor_replace_prob_reject_total', 0))
+        p_sum = float(stats.get('gss_anchor_replace_prob_p_sum', 0.0))
+        p_count = int(stats.get('gss_anchor_replace_prob_p_count', 0))
+        p_min = stats.get('gss_anchor_replace_prob_p_min', None)
+        p_max = stats.get('gss_anchor_replace_prob_p_max', None)
+        target_sim_sum = float(stats.get('gss_anchor_replace_prob_target_sim_sum', 0.0))
+        target_sim_count = int(stats.get('gss_anchor_replace_prob_target_sim_count', 0))
+        candidate_sim_sum = float(stats.get('gss_anchor_replace_prob_candidate_sim_sum', 0.0))
+        candidate_sim_count = int(stats.get('gss_anchor_replace_prob_candidate_sim_count', 0))
+        u_sum = float(stats.get('gss_anchor_replace_prob_u_sum', 0.0))
+        u_count = int(stats.get('gss_anchor_replace_prob_u_count', 0))
+        accept_rate = accept_total / max(candidate_total, 1)
+        p_mean = p_sum / max(p_count, 1)
+        target_sim_mean = target_sim_sum / max(target_sim_count, 1)
+        candidate_sim_mean = candidate_sim_sum / max(candidate_sim_count, 1)
+        u_mean = u_sum / max(u_count, 1)
+        p_min = 0.0 if p_min is None else float(p_min)
+        p_max = 0.0 if p_max is None else float(p_max)
+        print('[GSS-ANCHOR-REPLACE-PROB-SUMMARY] gss_anchor_replace_prob_enabled=True')
+        print('[GSS-ANCHOR-REPLACE-PROB-SUMMARY] gss_anchor_replace_prob_conservativeness=%.6f' %
+              float(self.gss_anchor_replace_prob_conservativeness))
+        print('[GSS-ANCHOR-REPLACE-PROB-SUMMARY] gss_anchor_replace_prob_candidate_total=' +
+              str(candidate_total))
+        print('[GSS-ANCHOR-REPLACE-PROB-SUMMARY] gss_anchor_replace_prob_accept_total=' +
+              str(accept_total))
+        print('[GSS-ANCHOR-REPLACE-PROB-SUMMARY] gss_anchor_replace_prob_reject_total=' +
+              str(reject_total))
+        print('[GSS-ANCHOR-REPLACE-PROB-SUMMARY] gss_anchor_replace_prob_accept_rate=%.6f' %
+              float(accept_rate))
+        print('[GSS-ANCHOR-REPLACE-PROB-SUMMARY] gss_anchor_replace_prob_p_sum=%.6f' %
+              float(p_sum))
+        print('[GSS-ANCHOR-REPLACE-PROB-SUMMARY] gss_anchor_replace_prob_p_count=' +
+              str(p_count))
+        print('[GSS-ANCHOR-REPLACE-PROB-SUMMARY] gss_anchor_replace_prob_p_mean=%.6f' %
+              float(p_mean))
+        print('[GSS-ANCHOR-REPLACE-PROB-SUMMARY] gss_anchor_replace_prob_p_min=%.6f' %
+              float(p_min))
+        print('[GSS-ANCHOR-REPLACE-PROB-SUMMARY] gss_anchor_replace_prob_p_max=%.6f' %
+              float(p_max))
+        print('[GSS-ANCHOR-REPLACE-PROB-SUMMARY] gss_anchor_replace_prob_target_sim_sum=%.6f' %
+              float(target_sim_sum))
+        print('[GSS-ANCHOR-REPLACE-PROB-SUMMARY] gss_anchor_replace_prob_target_sim_count=' +
+              str(target_sim_count))
+        print('[GSS-ANCHOR-REPLACE-PROB-SUMMARY] gss_anchor_replace_prob_target_sim_mean=%.6f' %
+              float(target_sim_mean))
+        print('[GSS-ANCHOR-REPLACE-PROB-SUMMARY] gss_anchor_replace_prob_candidate_sim_sum=%.6f' %
+              float(candidate_sim_sum))
+        print('[GSS-ANCHOR-REPLACE-PROB-SUMMARY] gss_anchor_replace_prob_candidate_sim_count=' +
+              str(candidate_sim_count))
+        print('[GSS-ANCHOR-REPLACE-PROB-SUMMARY] gss_anchor_replace_prob_candidate_sim_mean=%.6f' %
+              float(candidate_sim_mean))
+        print('[GSS-ANCHOR-REPLACE-PROB-SUMMARY] gss_anchor_replace_prob_u_sum=%.6f' %
+              float(u_sum))
+        print('[GSS-ANCHOR-REPLACE-PROB-SUMMARY] gss_anchor_replace_prob_u_count=' +
+              str(u_count))
+        print('[GSS-ANCHOR-REPLACE-PROB-SUMMARY] gss_anchor_replace_prob_u_mean=%.6f' %
+              float(u_mean))
 
     def clear_path(self):
         if os.path.exists(self.cur_train_file):

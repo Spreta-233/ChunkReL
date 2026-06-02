@@ -11,3 +11,40 @@ datasets/
 checkpoints/
 outputs/
 tmp/
+# data / outputs
+data/
+logs/
+results/
+checkpoints/
+outputs/
+runs/
+
+# python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# environments
+env/
+venv/
+.venv/
+*.egg-info/
+
+# model / large binary files
+*.pt
+*.pth
+*.pkl
+*.npy
+*.npz
+
+# system / IDE
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# archives
+*.zip
+*.rar
+*.7z

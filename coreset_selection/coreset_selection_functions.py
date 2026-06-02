@@ -7,6 +7,7 @@ import numpy as np
 import random
 import pickle
 import copy
+from itertools import combinations
 
 from dataset import single_task_dataset
 from functions import loss_functions
@@ -307,6 +308,583 @@ def _make_selected_data(sorted_ids, rand_data, id2pos, id2logits, loss_params, c
         id2loss_dif[d_id] = loss_dif
         if len(selected_data) == incremental_size:
             break
+    return selected_data, id2loss_dif
+
+
+def make_gss_anchor_replace_stats():
+    return {
+        'gss_anchor_replace_chunks_total': 0,
+        'gss_anchor_replace_final_kept_total': 0,
+        'gss_anchor_replace_tail_candidates_total': 0,
+        'gss_anchor_replace_replaced_total': 0,
+        'gss_anchor_replace_skip_similar_total': 0,
+        'gss_anchor_replace_similarity_sum': 0.0,
+        'gss_anchor_replace_similarity_count': 0,
+        'gss_anchor_replace_similarity_max': 0.0,
+        'gss_anchor_replace_rel_gap_sum': 0.0,
+        'gss_anchor_replace_rel_gap_count': 0,
+        'gss_anchor_replace_current_task_chunks': 0,
+        'gss_anchor_replace_historical_task_chunks': 0,
+        'gss_anchor_replace_current_anchor_replace_count': 0,
+        'gss_anchor_replace_historical_anchor_replace_count': 0,
+        'gss_anchor_replace_historical_top4_count': 0,
+        'gss_anchor_replace_historical_fallback_count': 0,
+        'gss_anchor_replace_permanent_rejected_total': 0,
+        'gss_anchor_replace_grad_layer_used': '',
+        'gss_anchor_replace_prob_candidate_total': 0,
+        'gss_anchor_replace_prob_accept_total': 0,
+        'gss_anchor_replace_prob_reject_total': 0,
+        'gss_anchor_replace_prob_p_sum': 0.0,
+        'gss_anchor_replace_prob_p_count': 0,
+        'gss_anchor_replace_prob_p_min': None,
+        'gss_anchor_replace_prob_p_max': None,
+        'gss_anchor_replace_prob_target_sim_sum': 0.0,
+        'gss_anchor_replace_prob_target_sim_count': 0,
+        'gss_anchor_replace_prob_candidate_sim_sum': 0.0,
+        'gss_anchor_replace_prob_candidate_sim_count': 0,
+        'gss_anchor_replace_prob_u_sum': 0.0,
+        'gss_anchor_replace_prob_u_count': 0,
+        'gss_anchor_replace_prob_conservativeness': 1.0
+    }
+
+
+def make_gss_iqp_stats():
+    return {
+        'gss_iqp_block_id': 0,
+        'gss_iqp_chunks_total': 0,
+        'gss_iqp_final_kept_total': 0,
+        'gss_iqp_current_iqp_chunks': 0,
+        'gss_iqp_historical_top4_count': 0,
+        'gss_iqp_historical_iqp_count': 0,
+        'gss_iqp_changed_chunks': 0,
+        'gss_iqp_changed_samples': 0,
+        'gss_iqp_pairwise_cos_rel_top4_sum': 0.0,
+        'gss_iqp_pairwise_cos_iqp_selected_sum': 0.0,
+        'gss_iqp_rel_sum_rel_top4_sum': 0.0,
+        'gss_iqp_rel_sum_iqp_selected_sum': 0.0,
+        'gss_iqp_permanent_rejected_total': 0,
+        'gss_iqp_grad_layer_used': ''
+    }
+
+
+def gss_anchor_replace_is_strategy(selection_strategy):
+    return selection_strategy in [
+        'rel_gss_anchor_replace',
+        'rel_gss_anchor_replace_all_tasks',
+        'rel_gss_anchor_replace_hist_top4',
+        'rel_gss_anchor_replace_hist_top4_prob'
+    ]
+
+
+def gss_anchor_replace_uses_anchor(selection_strategy, is_current_task):
+    if selection_strategy == 'rel_gss_anchor_replace_all_tasks':
+        return True
+    return selection_strategy in [
+        'rel_gss_anchor_replace',
+        'rel_gss_anchor_replace_hist_top4',
+        'rel_gss_anchor_replace_hist_top4_prob'
+    ] and bool(is_current_task)
+
+
+def gss_anchor_replace_uses_historical_rel_top4(selection_strategy, is_current_task):
+    return selection_strategy in [
+        'rel_gss_anchor_replace_hist_top4',
+        'rel_gss_anchor_replace_hist_top4_prob'
+    ] and not bool(is_current_task)
+
+
+def gss_anchor_replace_uses_prob_replace(selection_strategy):
+    return selection_strategy == 'rel_gss_anchor_replace_hist_top4_prob'
+
+
+def gss_iqp_is_strategy(selection_strategy):
+    return selection_strategy == 'rel_gss_iqp_hist_top4'
+
+
+def gss_iqp_uses_iqp(selection_strategy, is_current_task):
+    return selection_strategy == 'rel_gss_iqp_hist_top4' and bool(is_current_task)
+
+
+def gss_iqp_uses_historical_rel_top4(selection_strategy, is_current_task):
+    return selection_strategy == 'rel_gss_iqp_hist_top4' and not bool(is_current_task)
+
+
+def gss_anchor_replace_resolve_chunk_size(selection_strategy, is_current_task, selection_chunk_size,
+                                          base_incremental_size, remaining_select_size):
+    if selection_strategy == 'rel_gss_anchor_replace' and not bool(is_current_task):
+        return 1
+    if selection_chunk_size > 0:
+        return min(selection_chunk_size, remaining_select_size)
+    return min(base_incremental_size, remaining_select_size)
+
+
+def _add_gss_anchor_replace_stat(stats, key, value):
+    if stats is not None:
+        stats[key] = stats.get(key, 0) + value
+
+
+def _set_gss_anchor_replace_stat(stats, key, value):
+    if stats is not None:
+        stats[key] = value
+
+
+def _gss_anchor_replace_rng_uniform(prob_rng):
+    if hasattr(prob_rng, 'random_sample'):
+        return float(prob_rng.random_sample())
+    if hasattr(prob_rng, 'random'):
+        return float(prob_rng.random())
+    raise ValueError('Invalid probabilistic replacement RNG')
+
+
+def compute_gss_anchor_replace_prob(target_sim, candidate_sim, conservativeness=1.0):
+    conservativeness = float(conservativeness)
+    if conservativeness <= 0.0:
+        raise ValueError('gss_anchor_replace_prob_conservativeness must be > 0')
+    target_score = float(target_sim) + 1.0
+    candidate_score = float(candidate_sim) + 1.0
+    denom = target_score + conservativeness * candidate_score
+    if denom <= 1e-12:
+        return 0.5
+    return min(max(float(target_score / denom), 0.0), 1.0)
+
+
+def _record_gss_anchor_replace_prob(stats, candidate_sim, target_sim, p_replace, u_value, accepted):
+    _add_gss_anchor_replace_stat(stats, 'gss_anchor_replace_prob_candidate_total', 1)
+    _add_gss_anchor_replace_stat(stats, 'gss_anchor_replace_prob_p_sum', float(p_replace))
+    _add_gss_anchor_replace_stat(stats, 'gss_anchor_replace_prob_p_count', 1)
+    _add_gss_anchor_replace_stat(stats, 'gss_anchor_replace_prob_target_sim_sum', float(target_sim))
+    _add_gss_anchor_replace_stat(stats, 'gss_anchor_replace_prob_target_sim_count', 1)
+    _add_gss_anchor_replace_stat(stats, 'gss_anchor_replace_prob_candidate_sim_sum', float(candidate_sim))
+    _add_gss_anchor_replace_stat(stats, 'gss_anchor_replace_prob_candidate_sim_count', 1)
+    _add_gss_anchor_replace_stat(stats, 'gss_anchor_replace_prob_u_sum', float(u_value))
+    _add_gss_anchor_replace_stat(stats, 'gss_anchor_replace_prob_u_count', 1)
+    if bool(accepted):
+        _add_gss_anchor_replace_stat(stats, 'gss_anchor_replace_prob_accept_total', 1)
+    else:
+        _add_gss_anchor_replace_stat(stats, 'gss_anchor_replace_prob_reject_total', 1)
+    if stats is not None:
+        old_p_min = stats.get('gss_anchor_replace_prob_p_min', None)
+        old_p_max = stats.get('gss_anchor_replace_prob_p_max', None)
+        stats['gss_anchor_replace_prob_p_min'] = (
+            float(p_replace) if old_p_min is None else min(float(old_p_min), float(p_replace)))
+        stats['gss_anchor_replace_prob_p_max'] = (
+            float(p_replace) if old_p_max is None else max(float(old_p_max), float(p_replace)))
+
+
+def record_gss_anchor_replace_historical_top4(stats, final_kept):
+    _add_gss_anchor_replace_stat(stats, 'gss_anchor_replace_chunks_total', 1)
+    _add_gss_anchor_replace_stat(stats, 'gss_anchor_replace_historical_task_chunks', 1)
+    _add_gss_anchor_replace_stat(stats, 'gss_anchor_replace_historical_top4_count', 1)
+    _add_gss_anchor_replace_stat(stats, 'gss_anchor_replace_final_kept_total', int(final_kept))
+
+
+def record_gss_iqp_historical_top4(stats, final_kept):
+    _add_gss_anchor_replace_stat(stats, 'gss_iqp_chunks_total', 1)
+    _add_gss_anchor_replace_stat(stats, 'gss_iqp_historical_top4_count', 1)
+    _add_gss_anchor_replace_stat(stats, 'gss_iqp_final_kept_total', int(final_kept))
+
+
+def _normalize_grad_vector(grad):
+    grad = grad.view(-1).float()
+    return torch.nn.functional.normalize(grad, p=2, dim=0, eps=1e-12)
+
+
+def _resolve_grad_parameters(model, grad_layer):
+    requested_layer = str(grad_layer)
+    direct_names = [requested_layer]
+    if requested_layer == 'classifier':
+        direct_names = ['classifier', 'linear', 'fc', 'fc3', 'fc2', 'head']
+    for module_name in direct_names:
+        if hasattr(model, module_name):
+            module = getattr(model, module_name)
+            params = [(module_name + '.' + name, param)
+                      for name, param in module.named_parameters(recurse=True)
+                      if param.requires_grad]
+            if len(params) > 0:
+                return params, module_name
+    for module_name, module in model.named_modules():
+        if module_name == requested_layer:
+            params = [(module_name + '.' + name, param)
+                      for name, param in module.named_parameters(recurse=True)
+                      if param.requires_grad]
+            if len(params) > 0:
+                return params, module_name
+    params = []
+    for name, param in model.named_parameters():
+        if param.requires_grad and (name == requested_layer or name.startswith(requested_layer + '.')):
+            params.append((name, param))
+    if len(params) > 0:
+        return params, requested_layer
+    if requested_layer == 'classifier':
+        classifier_tokens = ['classifier', 'linear', 'fc', 'head']
+        for name, param in model.named_parameters():
+            if not param.requires_grad:
+                continue
+            if any(token in name for token in classifier_tokens):
+                params.append((name, param))
+        if len(params) > 0:
+            return params, 'classifier_auto'
+    params = [(name, param) for name, param in model.named_parameters() if param.requires_grad]
+    return params, 'all'
+
+
+def _extract_candidate_gradients(rand_data, candidate_ids, id2pos, model, transforms, on_cuda, loss_params,
+                                 grad_layer):
+    status = model.training
+    model.eval()
+    if on_cuda:
+        model.cuda()
+    grad_params, grad_layer_used = _resolve_grad_parameters(model=model, grad_layer=grad_layer)
+    loss_fn = loss_functions.CompliedLoss(
+        ce_factor=loss_params['ce_factor'], mse_factor=loss_params['mse_factor'], reduction='mean')
+    torch_rng_state = torch.get_rng_state()
+    cuda_rng_state = torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None
+    np_rng_state = np.random.get_state()
+    random_rng_state = random.getstate()
+    gradients_by_id = {}
+    try:
+        for d_id in candidate_ids:
+            di = rand_data[id2pos[d_id]]
+            if len(di) == 4:
+                _, sp, lab, logit = di
+            else:
+                _, sp, lab = di
+                logit = None
+            if transforms is not None:
+                sps = torch.unsqueeze(transforms(sp), dim=0)
+            else:
+                sps = torch.unsqueeze(sp, dim=0)
+            labs = torch.tensor([int(lab)], dtype=torch.long)
+            if logit is not None:
+                lab_logits = torch.unsqueeze(torch.tensor(logit, dtype=torch.float32), dim=0)
+            else:
+                lab_logits = None
+            if on_cuda:
+                sps = sps.cuda()
+                labs = labs.cuda()
+                if lab_logits is not None:
+                    lab_logits = lab_logits.cuda()
+            model.zero_grad()
+            loss = loss_fn(x=model(sps), y=labs, logits=lab_logits)
+            if hasattr(loss, 'dim') and loss.dim() > 0:
+                loss = loss.mean()
+            loss.backward()
+            grad_parts = []
+            for _, param in grad_params:
+                if param.grad is None:
+                    grad_parts.append(torch.zeros(param.numel(), dtype=torch.float32))
+                else:
+                    grad_parts.append(param.grad.detach().view(-1).cpu().float())
+            if len(grad_parts) == 0:
+                gradients_by_id[int(d_id)] = torch.zeros(1, dtype=torch.float32)
+            else:
+                gradients_by_id[int(d_id)] = torch.cat(grad_parts, dim=0)
+            model.zero_grad()
+    finally:
+        torch.set_rng_state(torch_rng_state)
+        if cuda_rng_state is not None:
+            torch.cuda.set_rng_state_all(cuda_rng_state)
+        np.random.set_state(np_rng_state)
+        random.setstate(random_rng_state)
+        if on_cuda:
+            model.cpu()
+        model.train(status)
+    return gradients_by_id, grad_layer_used
+
+
+def _pairwise_cosine_sum(items, normalized_gradients):
+    total = 0.0
+    if len(items) < 2:
+        return total
+    for i, j in combinations(range(len(items)), 2):
+        grad_i = normalized_gradients[int(items[i][0])]
+        grad_j = normalized_gradients[int(items[j][0])]
+        total += float(torch.dot(grad_i, grad_j))
+    return total
+
+
+def _rel_sum(items):
+    return float(sum(float(item[1]) for item in items))
+
+
+def _rank_sum(items, rank_by_id):
+    return int(sum(rank_by_id[int(item[0])] for item in items))
+
+
+def _stable_id_tuple(items):
+    return tuple(int(item[0]) for item in items)
+
+
+def _iqp_combo_is_better(pairwise_sum, rel_sum, rank_sum, id_tuple,
+                         best_pairwise_sum, best_rel_sum, best_rank_sum, best_id_tuple):
+    eps = 1e-12
+    if best_pairwise_sum is None:
+        return True
+    if pairwise_sum < best_pairwise_sum - eps:
+        return True
+    if abs(pairwise_sum - best_pairwise_sum) > eps:
+        return False
+    if rel_sum > best_rel_sum + eps:
+        return True
+    if abs(rel_sum - best_rel_sum) > eps:
+        return False
+    if rank_sum < best_rank_sum:
+        return True
+    if rank_sum > best_rank_sum:
+        return False
+    return id_tuple < best_id_tuple
+
+
+def select_gss_iqp_ranked_items(sorted_loss_diffs, gradients_by_id, window_size=8, select_size=4,
+                                stats=None, is_current_task=True):
+    window_size = max(int(window_size), 1)
+    select_size = max(int(select_size), 1)
+    window_size = max(window_size, select_size)
+    window_items = list(sorted_loss_diffs[:min(window_size, len(sorted_loss_diffs))])
+    rel_top_items = list(window_items[:min(select_size, len(window_items))])
+    _add_gss_anchor_replace_stat(stats, 'gss_iqp_chunks_total', 1)
+    if not bool(is_current_task):
+        _add_gss_anchor_replace_stat(stats, 'gss_iqp_historical_top4_count', 1)
+        _add_gss_anchor_replace_stat(stats, 'gss_iqp_final_kept_total', len(rel_top_items))
+        return rel_top_items
+    if len(window_items) == 0:
+        return []
+    if len(window_items) < select_size:
+        _add_gss_anchor_replace_stat(stats, 'gss_iqp_final_kept_total', len(window_items))
+        return window_items
+    normalized_gradients = {
+        int(item[0]): _normalize_grad_vector(gradients_by_id[int(item[0])])
+        for item in window_items
+    }
+    rel_top_pairwise = _pairwise_cosine_sum(rel_top_items, normalized_gradients)
+    rel_top_rel_sum = _rel_sum(rel_top_items)
+    selected_items = rel_top_items
+    selected_pairwise = rel_top_pairwise
+    selected_rel_sum = rel_top_rel_sum
+    if len(window_items) >= select_size:
+        _add_gss_anchor_replace_stat(stats, 'gss_iqp_current_iqp_chunks', 1)
+        rank_by_id = {int(item[0]): rank for rank, item in enumerate(window_items)}
+        best_combo = None
+        best_pairwise_sum = None
+        best_rel_sum = None
+        best_rank_sum = None
+        best_id_tuple = None
+        for combo in combinations(window_items, select_size):
+            combo = list(combo)
+            combo_pairwise_sum = _pairwise_cosine_sum(combo, normalized_gradients)
+            combo_rel_sum = _rel_sum(combo)
+            combo_rank_sum = _rank_sum(combo, rank_by_id)
+            combo_id_tuple = _stable_id_tuple(combo)
+            if _iqp_combo_is_better(combo_pairwise_sum, combo_rel_sum, combo_rank_sum, combo_id_tuple,
+                                    best_pairwise_sum, best_rel_sum, best_rank_sum, best_id_tuple):
+                best_combo = combo
+                best_pairwise_sum = combo_pairwise_sum
+                best_rel_sum = combo_rel_sum
+                best_rank_sum = combo_rank_sum
+                best_id_tuple = combo_id_tuple
+        selected_items = best_combo
+        selected_pairwise = best_pairwise_sum
+        selected_rel_sum = best_rel_sum
+    rel_ids = set(int(item[0]) for item in rel_top_items)
+    selected_ids = set(int(item[0]) for item in selected_items)
+    if rel_ids != selected_ids:
+        _add_gss_anchor_replace_stat(stats, 'gss_iqp_changed_chunks', 1)
+        _add_gss_anchor_replace_stat(stats, 'gss_iqp_changed_samples', len(rel_ids - selected_ids))
+    _add_gss_anchor_replace_stat(stats, 'gss_iqp_pairwise_cos_rel_top4_sum', rel_top_pairwise)
+    _add_gss_anchor_replace_stat(stats, 'gss_iqp_pairwise_cos_iqp_selected_sum', selected_pairwise)
+    _add_gss_anchor_replace_stat(stats, 'gss_iqp_rel_sum_rel_top4_sum', rel_top_rel_sum)
+    _add_gss_anchor_replace_stat(stats, 'gss_iqp_rel_sum_iqp_selected_sum', selected_rel_sum)
+    _add_gss_anchor_replace_stat(stats, 'gss_iqp_final_kept_total', len(selected_items))
+    return selected_items
+
+
+def select_anchor_replace_ranked_items(sorted_loss_diffs, gradients_by_id, window_size=8, anchor_size=4,
+                                       sim_threshold=0.90, stats=None, is_current_task=True,
+                                       probabilistic_replace=False, prob_rng=None,
+                                       prob_conservativeness=1.0):
+    window_size = max(int(window_size), 1)
+    anchor_size = max(int(anchor_size), 1)
+    anchor_size = min(anchor_size, len(sorted_loss_diffs))
+    window_size = max(window_size, anchor_size)
+    window_items = list(sorted_loss_diffs[:min(window_size, len(sorted_loss_diffs))])
+    selected_items = list(window_items[:anchor_size])
+    tail_items = list(window_items[anchor_size:])
+    normalized_gradients = {
+        int(item[0]): _normalize_grad_vector(gradients_by_id[int(item[0])])
+        for item in window_items
+    }
+    _add_gss_anchor_replace_stat(stats, 'gss_anchor_replace_chunks_total', 1)
+    if bool(is_current_task):
+        _add_gss_anchor_replace_stat(stats, 'gss_anchor_replace_current_task_chunks', 1)
+        _add_gss_anchor_replace_stat(stats, 'gss_anchor_replace_current_anchor_replace_count', 1)
+    else:
+        _add_gss_anchor_replace_stat(stats, 'gss_anchor_replace_historical_task_chunks', 1)
+        _add_gss_anchor_replace_stat(stats, 'gss_anchor_replace_historical_anchor_replace_count', 1)
+    _add_gss_anchor_replace_stat(stats, 'gss_anchor_replace_tail_candidates_total', len(tail_items))
+    if bool(probabilistic_replace):
+        prob_conservativeness = float(prob_conservativeness)
+        if prob_conservativeness <= 0.0:
+            raise ValueError('gss_anchor_replace_prob_conservativeness must be > 0')
+        _set_gss_anchor_replace_stat(
+            stats, 'gss_anchor_replace_prob_conservativeness', prob_conservativeness)
+    for candidate_item in tail_items:
+        cand_id, cand_rel = candidate_item
+        cand_grad = normalized_gradients[int(cand_id)]
+        sim_values = []
+        for selected_item in selected_items:
+            selected_id = int(selected_item[0])
+            selected_grad = normalized_gradients[selected_id]
+            sim_value = float(torch.dot(cand_grad, selected_grad))
+            sim_values.append(sim_value)
+        sim_max = max(sim_values) if len(sim_values) > 0 else 0.0
+        _add_gss_anchor_replace_stat(stats, 'gss_anchor_replace_similarity_sum', sim_max)
+        _add_gss_anchor_replace_stat(stats, 'gss_anchor_replace_similarity_count', 1)
+        if stats is not None:
+            stats['gss_anchor_replace_similarity_max'] = max(
+                stats.get('gss_anchor_replace_similarity_max', 0.0), sim_max)
+        if sim_max >= float(sim_threshold):
+            _add_gss_anchor_replace_stat(stats, 'gss_anchor_replace_skip_similar_total', 1)
+            continue
+        replace_pos = min(range(len(selected_items)), key=lambda idx: float(selected_items[idx][1]))
+        replace_target = selected_items[replace_pos]
+        if bool(probabilistic_replace):
+            if prob_rng is None:
+                raise ValueError('prob_rng is required when probabilistic_replace=True')
+            target_id = int(replace_target[0])
+            target_grad = normalized_gradients[target_id]
+            target_sim_values = []
+            for idx, selected_item in enumerate(selected_items):
+                if idx == replace_pos:
+                    continue
+                selected_id = int(selected_item[0])
+                selected_grad = normalized_gradients[selected_id]
+                target_sim_values.append(float(torch.dot(target_grad, selected_grad)))
+            target_sim = max(target_sim_values) if len(target_sim_values) > 0 else 0.0
+            p_replace = compute_gss_anchor_replace_prob(
+                target_sim=target_sim,
+                candidate_sim=sim_max,
+                conservativeness=prob_conservativeness
+            )
+            u_value = _gss_anchor_replace_rng_uniform(prob_rng)
+            accepted = u_value < p_replace
+            _record_gss_anchor_replace_prob(
+                stats=stats,
+                candidate_sim=sim_max,
+                target_sim=target_sim,
+                p_replace=p_replace,
+                u_value=u_value,
+                accepted=accepted
+            )
+            if not bool(accepted):
+                continue
+        selected_items[replace_pos] = candidate_item
+        _add_gss_anchor_replace_stat(stats, 'gss_anchor_replace_replaced_total', 1)
+        _add_gss_anchor_replace_stat(
+            stats, 'gss_anchor_replace_rel_gap_sum', float(replace_target[1]) - float(cand_rel))
+        _add_gss_anchor_replace_stat(stats, 'gss_anchor_replace_rel_gap_count', 1)
+    _add_gss_anchor_replace_stat(stats, 'gss_anchor_replace_final_kept_total', len(selected_items))
+    return selected_items
+
+
+def select_by_loss_diff_with_gss_iqp(ref_loss_dic, rand_data, model, incremental_size, transforms, on_cuda,
+                                     loss_params, class_sizes=None, window_size=8, select_size=4,
+                                     grad_layer='classifier', stats=None, is_current_task=True):
+    loss_diffs, id2pos, id2logits = _loss_diff_for_candidates(
+        ref_loss_dic=ref_loss_dic,
+        rand_data=rand_data,
+        model=model,
+        transforms=transforms,
+        on_cuda=on_cuda,
+        loss_params=loss_params
+    )
+    sorted_loss_diffs = sorted(loss_diffs.items(), key=lambda x: x[1], reverse=True)
+    select_size = min(int(select_size), int(incremental_size))
+    window_size = max(int(window_size), select_size)
+    window_items = sorted_loss_diffs[:min(window_size, len(sorted_loss_diffs))]
+    candidate_ids = [x[0] for x in window_items]
+    gradients_by_id, grad_layer_used = _extract_candidate_gradients(
+        rand_data=rand_data,
+        candidate_ids=candidate_ids,
+        id2pos=id2pos,
+        model=model,
+        transforms=transforms,
+        on_cuda=on_cuda,
+        loss_params=loss_params,
+        grad_layer=grad_layer
+    )
+    _set_gss_anchor_replace_stat(stats, 'gss_iqp_grad_layer_used', grad_layer_used)
+    selected_items = select_gss_iqp_ranked_items(
+        sorted_loss_diffs=sorted_loss_diffs,
+        gradients_by_id=gradients_by_id,
+        window_size=window_size,
+        select_size=select_size,
+        stats=stats,
+        is_current_task=is_current_task
+    )
+    selected_data, id2loss_dif = _make_selected_data(
+        sorted_ids=selected_items,
+        rand_data=rand_data,
+        id2pos=id2pos,
+        id2logits=id2logits,
+        loss_params=loss_params,
+        class_sizes=class_sizes,
+        incremental_size=len(selected_items)
+    )
+    _print_selected_data_checks(selected_data, len(selected_items))
+    return selected_data, id2loss_dif
+
+
+def select_by_loss_diff_with_anchor_replace(ref_loss_dic, rand_data, model, incremental_size, transforms, on_cuda,
+                                            loss_params, class_sizes=None, window_size=8, anchor_size=4,
+                                            sim_threshold=0.90, grad_layer='classifier', stats=None,
+                                            is_current_task=True, probabilistic_replace=False, prob_rng=None,
+                                            prob_conservativeness=1.0):
+    loss_diffs, id2pos, id2logits = _loss_diff_for_candidates(
+        ref_loss_dic=ref_loss_dic,
+        rand_data=rand_data,
+        model=model,
+        transforms=transforms,
+        on_cuda=on_cuda,
+        loss_params=loss_params
+    )
+    sorted_loss_diffs = sorted(loss_diffs.items(), key=lambda x: x[1], reverse=True)
+    anchor_size = min(int(anchor_size), int(incremental_size), len(sorted_loss_diffs))
+    window_size = max(int(window_size), anchor_size)
+    window_items = sorted_loss_diffs[:min(window_size, len(sorted_loss_diffs))]
+    candidate_ids = [x[0] for x in window_items]
+    gradients_by_id, grad_layer_used = _extract_candidate_gradients(
+        rand_data=rand_data,
+        candidate_ids=candidate_ids,
+        id2pos=id2pos,
+        model=model,
+        transforms=transforms,
+        on_cuda=on_cuda,
+        loss_params=loss_params,
+        grad_layer=grad_layer
+    )
+    _set_gss_anchor_replace_stat(stats, 'gss_anchor_replace_grad_layer_used', grad_layer_used)
+    selected_items = select_anchor_replace_ranked_items(
+        sorted_loss_diffs=sorted_loss_diffs,
+        gradients_by_id=gradients_by_id,
+        window_size=window_size,
+        anchor_size=anchor_size,
+        sim_threshold=sim_threshold,
+        stats=stats,
+        is_current_task=is_current_task,
+        probabilistic_replace=probabilistic_replace,
+        prob_rng=prob_rng,
+        prob_conservativeness=prob_conservativeness
+    )
+    selected_data, id2loss_dif = _make_selected_data(
+        sorted_ids=selected_items,
+        rand_data=rand_data,
+        id2pos=id2pos,
+        id2logits=id2logits,
+        loss_params=loss_params,
+        class_sizes=class_sizes,
+        incremental_size=len(selected_items)
+    )
+    _print_selected_data_checks(selected_data, len(selected_items))
     return selected_data, id2loss_dif
 
 
