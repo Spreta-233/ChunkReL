@@ -57,7 +57,15 @@ class CoresetBuffer(object):
             filter_feature_source=self.selection_params.get('filter_feature_source', 'current_model'),
             filter_feature_layer=self.selection_params.get('filter_feature_layer', 'penultimate'),
             filter_reject_dominated=self.selection_params.get('filter_reject_dominated', False),
-            filter_verbose=self.selection_params.get('filter_verbose', False)
+            filter_verbose=self.selection_params.get('filter_verbose', False),
+            gss_anchor_replace_window=self.selection_params.get('gss_anchor_replace_window', 8),
+            gss_anchor_replace_anchor_size=self.selection_params.get('gss_anchor_replace_anchor_size', 4),
+            gss_anchor_replace_sim_threshold=self.selection_params.get('gss_anchor_replace_sim_threshold', 0.90),
+            gss_grad_layer=self.selection_params.get('gss_grad_layer', 'classifier'),
+            gss_anchor_replace_prob_seed_offset=self.selection_params.get(
+                'gss_anchor_replace_prob_seed_offset', 0),
+            gss_anchor_replace_prob_conservativeness=self.selection_params.get(
+                'gss_anchor_replace_prob_conservativeness', 1.0)
         )
         self.data = []
         self.id2task = {}
@@ -66,7 +74,15 @@ class CoresetBuffer(object):
         self.id_bias = 0
 
     def update_buffer(self, task_cnts, task_id, cur_x, cur_y, full_cur_x, full_cur_y, cur_id2logit=None,
-                      next_x=None, next_y=None):
+                      next_x=None, next_y=None, ref_proxy_model=None, snapshot_state_dicts=None):
+        if self.selection_params.get('selection_strategy', 'rel') in [
+                'rel_gss_anchor_replace',
+                'rel_gss_anchor_replace_all_tasks',
+                'rel_gss_anchor_replace_hist_top4',
+                'rel_gss_anchor_replace_hist_top4_prob']:
+            self.coreset_selector.reset_gss_anchor_replace_summary()
+        if self.selection_params.get('selection_strategy', 'rel') == 'rel_gss_iqp_hist_top4':
+            self.coreset_selector.reset_gss_iqp_summary()
         # distribute buffer size to each task
         task_sizes = []
         for i in range(task_id + 1):
@@ -141,7 +157,8 @@ class CoresetBuffer(object):
                 class_pool=self.task_dic[i],
                 id_list=id_pool,
                 id2logit=id2logit,
-                extra_data=extra_data
+                extra_data=extra_data,
+                gss_anchor_replace_is_current_task=False
             )
             self.coreset_selector.clear_path()
             # update data and id2task
@@ -153,22 +170,78 @@ class CoresetBuffer(object):
             id_pool.clear()
         # select current task data
         cur_select_size = self.buffer_size - pre_select_size
-        # train current ref model
-        print('\ttrain ref model for task', task_id, cur_select_size)
-        if 'ref_sample_per_task' in self.selection_params['ref_train_params'] and \
-                self.selection_params['ref_train_params']['ref_sample_per_task'] > 0:
-            extra_data = self.make_extra_ref_samples(
-                sample_per_task=self.selection_params['ref_train_params']['ref_sample_per_task'])
-        else:
-            extra_data = None
-        self.coreset_selector.train_ref_model(
-            x=full_cur_x,
-            y=full_cur_y,
-            verbose=False,
-            extra_data=extra_data,
-            log_file=os.path.join(self.local_path, 'holdout_model_loss' + str(task_id) + '.pkl')
-        )
         loss_dic_dump_file = os.path.join(self.local_path, 'ref_loss_dic' + str(task_id) + '.pkl')
+        rel_ref_mode = self.selection_params.get('rel_ref_mode', 'trained_ref')
+        ref_loss_dic = None
+        if rel_ref_mode == 'trained_ref':
+            # train current ref model
+            print('\ttrain ref model for task', task_id, cur_select_size)
+            if 'ref_sample_per_task' in self.selection_params['ref_train_params'] and \
+                    self.selection_params['ref_train_params']['ref_sample_per_task'] > 0:
+                extra_data = self.make_extra_ref_samples(
+                    sample_per_task=self.selection_params['ref_train_params']['ref_sample_per_task'])
+            else:
+                extra_data = None
+            self.coreset_selector.train_ref_model(
+                x=full_cur_x,
+                y=full_cur_y,
+                verbose=False,
+                extra_data=extra_data,
+                log_file=os.path.join(self.local_path, 'holdout_model_loss' + str(task_id) + '.pkl')
+            )
+        elif rel_ref_mode == 'final_model':
+            print('\tcompute final-model ref loss for task', task_id, cur_select_size)
+            ref_loss_dic = self.coreset_selector.compute_ref_loss_dic_from_model(
+                x=cur_x,
+                y=cur_y,
+                ref_proxy_model=ref_proxy_model,
+                id_list=cur_id_list,
+                id2logit=new_id2logit,
+                loss_dic_dump_file=loss_dic_dump_file
+            )
+        elif rel_ref_mode == 'snapshot':
+            print('\tcompute snapshot ref loss for task', task_id, cur_select_size)
+            ref_loss_dic = self.coreset_selector.compute_ref_loss_dic_from_snapshots(
+                x=cur_x,
+                y=cur_y,
+                snapshot_state_dicts=snapshot_state_dicts,
+                id_list=cur_id_list,
+                id2logit=new_id2logit,
+                snapshot_reduce=self.selection_params.get('snapshot_reduce', 'quantile'),
+                snapshot_quantile=self.selection_params.get('snapshot_quantile', 0.2),
+                snapshot_agreement_lambda=self.selection_params.get('snapshot_agreement_lambda', 0.0),
+                snapshot_dynamic_calibration=self.selection_params.get('snapshot_dynamic_calibration', False),
+                snapshot_calib_beta=self.selection_params.get('snapshot_calib_beta', 0.2),
+                snapshot_calib_rho_max=self.selection_params.get('snapshot_calib_rho_max', 0.1),
+                snapshot_calib_tau=self.selection_params.get('snapshot_calib_tau', 0.5),
+                snapshot_calib_norm_scope=self.selection_params.get('snapshot_calib_norm_scope', 'task'),
+                snapshot_calib_use_confidence=self.selection_params.get(
+                    'snapshot_calib_use_confidence', False),
+                snapshot_calib_use_variability=self.selection_params.get(
+                    'snapshot_calib_use_variability', False),
+                snapshot_calib_use_forgetting=self.selection_params.get(
+                    'snapshot_calib_use_forgetting', False),
+                snapshot_calib_conf_gate=self.selection_params.get(
+                    'snapshot_calib_conf_gate', 'linear'),
+                snapshot_calib_conf_gamma=self.selection_params.get(
+                    'snapshot_calib_conf_gamma', 1.0),
+                snapshot_calib_conf_eps=self.selection_params.get(
+                    'snapshot_calib_conf_eps', 1e-6),
+                snapshot_calib_conf_log_lambda=self.selection_params.get(
+                    'snapshot_calib_conf_log_lambda', 0.2),
+                snapshot_calib_lowconf_q=self.selection_params.get(
+                    'snapshot_calib_lowconf_q', 0.20),
+                snapshot_calib_lowvar_tail_q=self.selection_params.get(
+                    'snapshot_calib_lowvar_tail_q', 0.05),
+                snapshot_calib_lowvar_eta=self.selection_params.get(
+                    'snapshot_calib_lowvar_eta', 0.02),
+                snapshot_calib_highconf_protect_q=self.selection_params.get(
+                    'snapshot_calib_highconf_protect_q', 0.80),
+                snapshot_verbose=self.selection_params.get('snapshot_verbose', False),
+                loss_dic_dump_file=loss_dic_dump_file
+            )
+        else:
+            raise ValueError('Invalid rel_ref_mode: ' + str(rel_ref_mode))
         # coreset selection
         print('\tselect coreset for task', task_id)
         extra_data = self.make_extra_data(
@@ -185,13 +258,14 @@ class CoresetBuffer(object):
             x=cur_x,
             y=cur_y,
             select_size=cur_select_size,
-            loss_dic=None,
-            loss_dic_dump_file=loss_dic_dump_file,
+            loss_dic=ref_loss_dic,
+            loss_dic_dump_file=loss_dic_dump_file if ref_loss_dic is None else None,
             verbose=False,
             class_pool=self.task_dic[task_id],
             id_list=cur_id_list,
             id2logit=new_id2logit,
-            extra_data=extra_data
+            extra_data=extra_data,
+            gss_anchor_replace_is_current_task=True
         )
         self.coreset_selector.clear_path()
         self.id_bias += cur_x.shape[0]

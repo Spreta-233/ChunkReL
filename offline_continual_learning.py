@@ -25,6 +25,34 @@ def make_selection_params(opts):
         },
         'selection_strategy': opts.selection_strategy,
         'selection_chunk_size': opts.selection_chunk_size,
+        'gss_anchor_replace_window': opts.gss_anchor_replace_window,
+        'gss_anchor_replace_anchor_size': opts.gss_anchor_replace_anchor_size,
+        'gss_anchor_replace_sim_threshold': opts.gss_anchor_replace_sim_threshold,
+        'gss_anchor_replace_prob_seed_offset': opts.gss_anchor_replace_prob_seed_offset,
+        'gss_anchor_replace_prob_conservativeness': opts.gss_anchor_replace_prob_conservativeness,
+        'gss_grad_layer': opts.gss_grad_layer,
+        'rel_ref_mode': opts.rel_ref_mode,
+        'snapshot_points': opts.snapshot_points,
+        'snapshot_reduce': opts.snapshot_reduce,
+        'snapshot_quantile': opts.snapshot_quantile,
+        'snapshot_agreement_lambda': opts.snapshot_agreement_lambda,
+        'snapshot_dynamic_calibration': opts.snapshot_dynamic_calibration,
+        'snapshot_calib_beta': opts.snapshot_calib_beta,
+        'snapshot_calib_rho_max': opts.snapshot_calib_rho_max,
+        'snapshot_calib_tau': opts.snapshot_calib_tau,
+        'snapshot_calib_norm_scope': opts.snapshot_calib_norm_scope,
+        'snapshot_calib_use_confidence': opts.snapshot_calib_use_confidence,
+        'snapshot_calib_use_variability': opts.snapshot_calib_use_variability,
+        'snapshot_calib_use_forgetting': opts.snapshot_calib_use_forgetting,
+        'snapshot_calib_conf_gate': opts.snapshot_calib_conf_gate,
+        'snapshot_calib_conf_gamma': opts.snapshot_calib_conf_gamma,
+        'snapshot_calib_conf_eps': opts.snapshot_calib_conf_eps,
+        'snapshot_calib_conf_log_lambda': opts.snapshot_calib_conf_log_lambda,
+        'snapshot_calib_lowconf_q': opts.snapshot_calib_lowconf_q,
+        'snapshot_calib_lowvar_tail_q': opts.snapshot_calib_lowvar_tail_q,
+        'snapshot_calib_lowvar_eta': opts.snapshot_calib_lowvar_eta,
+        'snapshot_calib_highconf_protect_q': opts.snapshot_calib_highconf_protect_q,
+        'snapshot_verbose': opts.snapshot_verbose,
         'div_lambda': opts.div_lambda,
         'div_candidate_ratio': opts.div_candidate_ratio,
         'div_feature_source': opts.div_feature_source,
@@ -158,8 +186,46 @@ if __name__ == '__main__':
     parser.add_argument('--buffer_type', type=str, default='coreset')
     parser.add_argument('--ref_sample_per_task', type=int, default=-1)
     parser.add_argument('--memory_allocation', type=str, default='equal', choices=['equal'])
-    parser.add_argument('--selection_strategy', type=str, default='rel', choices=['rel', 'rel_filter', 'rel_diversity'])
+    parser.add_argument('--selection_strategy', type=str, default='rel',
+                        choices=['rel', 'rel_filter', 'rel_diversity', 'rel_gss_anchor_replace',
+                                  'rel_gss_anchor_replace_all_tasks',
+                                  'rel_gss_anchor_replace_hist_top4',
+                                  'rel_gss_anchor_replace_hist_top4_prob',
+                                  'rel_gss_iqp_hist_top4'])
     parser.add_argument('--selection_chunk_size', type=int, default=0)
+    parser.add_argument('--gss_anchor_replace_window', type=int, default=8)
+    parser.add_argument('--gss_anchor_replace_anchor_size', type=int, default=4)
+    parser.add_argument('--gss_anchor_replace_sim_threshold', type=float, default=0.90)
+    parser.add_argument('--gss_anchor_replace_prob_seed_offset', type=int, default=0)
+    parser.add_argument('--gss_anchor_replace_prob_conservativeness', type=float, default=1.0)
+    parser.add_argument('--gss_grad_layer', type=str, default='classifier')
+    parser.add_argument('--rel_ref_mode', type=str, default='trained_ref',
+                        choices=['trained_ref', 'final_model', 'snapshot'])
+    parser.add_argument('--snapshot_points', type=str, default='0.2,0.4,0.6,0.8,1.0')
+    parser.add_argument('--snapshot_reduce', type=str, default='quantile',
+                        choices=['min', 'median', 'quantile'])
+    parser.add_argument('--snapshot_quantile', type=float, default=0.2)
+    parser.add_argument('--snapshot_agreement_lambda', type=float, default=0.0)
+    parser.add_argument('--snapshot_dynamic_calibration', action='store_true')
+    parser.add_argument('--snapshot_calib_beta', type=float, default=0.2)
+    parser.add_argument('--snapshot_calib_rho_max', type=float, default=0.1)
+    parser.add_argument('--snapshot_calib_tau', type=float, default=0.5)
+    parser.add_argument('--snapshot_calib_norm_scope', type=str, default='task', choices=['task'])
+    parser.add_argument('--snapshot_calib_use_confidence', action='store_true')
+    parser.add_argument('--snapshot_calib_use_variability', action='store_true')
+    parser.add_argument('--snapshot_calib_use_forgetting', action='store_true')
+    parser.add_argument('--snapshot_calib_conf_gate', type=str, default='linear',
+                        choices=['linear', 'focal_log', 'linear_log_residual',
+                                 'linear_log_residual_lowvar_tail',
+                                 'linear_log_residual_protected_lowvar_tail'])
+    parser.add_argument('--snapshot_calib_conf_gamma', type=float, default=1.0)
+    parser.add_argument('--snapshot_calib_conf_eps', type=float, default=1e-6)
+    parser.add_argument('--snapshot_calib_conf_log_lambda', type=float, default=0.2)
+    parser.add_argument('--snapshot_calib_lowconf_q', type=float, default=0.20)
+    parser.add_argument('--snapshot_calib_lowvar_tail_q', type=float, default=0.05)
+    parser.add_argument('--snapshot_calib_lowvar_eta', type=float, default=0.02)
+    parser.add_argument('--snapshot_calib_highconf_protect_q', type=float, default=0.80)
+    parser.add_argument('--snapshot_verbose', action='store_true')
     parser.add_argument('--div_lambda', type=float, default=0.1)
     parser.add_argument('--div_candidate_ratio', type=int, default=3)
     parser.add_argument('--div_feature_source', type=str, default='current_model', choices=['current_model', 'holdout_model'])
@@ -207,6 +273,34 @@ if __name__ == '__main__':
     print('memory allocation\t\t', args.memory_allocation)
     print('selection strategy\t\t', args.selection_strategy)
     print('selection chunk size\t\t', args.selection_chunk_size)
+    print('gss anchor replace window\t\t', args.gss_anchor_replace_window)
+    print('gss anchor replace anchor size\t\t', args.gss_anchor_replace_anchor_size)
+    print('gss anchor replace sim threshold\t\t', args.gss_anchor_replace_sim_threshold)
+    print('gss anchor replace prob seed offset\t\t', args.gss_anchor_replace_prob_seed_offset)
+    print('gss anchor replace prob conservativeness\t\t', args.gss_anchor_replace_prob_conservativeness)
+    print('gss grad layer\t\t', args.gss_grad_layer)
+    print('rel ref mode\t\t', args.rel_ref_mode)
+    print('snapshot points\t\t', args.snapshot_points)
+    print('snapshot reduce\t\t', args.snapshot_reduce)
+    print('snapshot quantile\t\t', args.snapshot_quantile)
+    print('snapshot agreement lambda\t\t', args.snapshot_agreement_lambda)
+    print('snapshot dynamic calibration\t\t', args.snapshot_dynamic_calibration)
+    print('snapshot calib beta\t\t', args.snapshot_calib_beta)
+    print('snapshot calib rho max\t\t', args.snapshot_calib_rho_max)
+    print('snapshot calib tau\t\t', args.snapshot_calib_tau)
+    print('snapshot calib norm scope\t\t', args.snapshot_calib_norm_scope)
+    print('snapshot calib use confidence\t\t', args.snapshot_calib_use_confidence)
+    print('snapshot calib use variability\t\t', args.snapshot_calib_use_variability)
+    print('snapshot calib use forgetting\t\t', args.snapshot_calib_use_forgetting)
+    print('snapshot calib conf gate\t\t', args.snapshot_calib_conf_gate)
+    print('snapshot calib conf gamma\t\t', args.snapshot_calib_conf_gamma)
+    print('snapshot calib conf eps\t\t', args.snapshot_calib_conf_eps)
+    print('snapshot calib conf log lambda\t\t', args.snapshot_calib_conf_log_lambda)
+    print('snapshot calib lowconf q\t\t', args.snapshot_calib_lowconf_q)
+    print('snapshot calib lowvar tail q\t\t', args.snapshot_calib_lowvar_tail_q)
+    print('snapshot calib lowvar eta\t\t', args.snapshot_calib_lowvar_eta)
+    print('snapshot calib highconf protect q\t\t', args.snapshot_calib_highconf_protect_q)
+    print('snapshot verbose\t\t', args.snapshot_verbose)
     print('div lambda\t\t', args.div_lambda)
     print('div candidate ratio\t\t', args.div_candidate_ratio)
     print('div feature source\t\t', args.div_feature_source)

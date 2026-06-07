@@ -11,3 +11,15 @@ datasets/
 checkpoints/
 outputs/
 tmp/
+logs/
+results/
+data/
+*.log
+*.pkl
+*.zip
+*.pt
+*.pth
+*.npy
+*.npz
+__pycache__/
+.pytest_cache/

@@ -63,11 +63,45 @@ class ContinualRunner(object):
         self.results = []
         self.mask_results = []
         self.task_cnts = []
+        self.current_task_snapshot_state_dicts = None
+
+    def _resolve_snapshot_epochs(self):
+        if self.selection_params.get('rel_ref_mode', 'trained_ref') != 'snapshot':
+            return []
+        points = str(self.selection_params.get('snapshot_points', '0.2,0.4,0.6,0.8,1.0'))
+        epochs = int(self.train_params['epochs'])
+        snapshot_epochs = set()
+        for raw_point in points.split(','):
+            raw_point = raw_point.strip()
+            if len(raw_point) == 0:
+                continue
+            point = float(raw_point)
+            if point <= 0.0:
+                raise ValueError('snapshot_points must be positive')
+            if point <= 1.0:
+                epoch_id = int(round(point * epochs))
+            else:
+                epoch_id = int(round(point))
+            epoch_id = min(max(epoch_id, 1), epochs)
+            snapshot_epochs.add(epoch_id)
+        if len(snapshot_epochs) == 0:
+            raise ValueError('snapshot_points produced no snapshot epochs')
+        return sorted(snapshot_epochs)
+
+    def _copy_cpu_state_dict(self):
+        return {
+            name: tensor.clone().detach().cpu()
+            for name, tensor in self.model.state_dict().items()
+        }
 
     def train_single_task(self, train_loader, eval_loaders, verbose=True, do_evaluation=True):
         self.model.train()
         if self.train_params['use_cuda']:
             self.model.cuda()
+        snapshot_epochs = self._resolve_snapshot_epochs()
+        self.current_task_snapshot_state_dicts = [] if len(snapshot_epochs) > 0 else None
+        if len(snapshot_epochs) > 0 and self.selection_params.get('snapshot_verbose', False):
+            print('[SNAPSHOT-REF] snapshot epochs:', snapshot_epochs)
         # make loss function
         loss_fn = torch.nn.CrossEntropyLoss()
         # make optimizer
@@ -159,6 +193,10 @@ class ContinualRunner(object):
                 opt.step()
                 step += 1
             print('finish training epoch:', i)
+            if (i + 1) in snapshot_epochs:
+                self.current_task_snapshot_state_dicts.append(self._copy_cpu_state_dict())
+                if self.selection_params.get('snapshot_verbose', False):
+                    print('[SNAPSHOT-REF] saved snapshot after epoch', i + 1)
             if do_evaluation and i % 10 == 0:
                 accs, losses = self.evaluate_model(eval_loaders=eval_loaders, on_cuda=self.use_cuda)
                 print('\taccuracy on test is:', np.mean(accs), accs, losses)
@@ -233,6 +271,7 @@ class ContinualRunner(object):
         cur_x = cur_x.numpy()
         cur_y = cur_y.numpy()
         if isinstance(self.buffer, coreset_buffer.CoresetBuffer):
+            rel_ref_mode = self.selection_params.get('rel_ref_mode', 'trained_ref')
             self.buffer.update_buffer(
                 task_cnts=self.task_cnts,
                 task_id=self.seen_tasks,
@@ -242,8 +281,14 @@ class ContinualRunner(object):
                 full_cur_y=full_cur_y,
                 cur_id2logit=cur_id2logit,
                 next_x=next_x,
-                next_y=next_y
+                next_y=next_y,
+                ref_proxy_model=self.model if rel_ref_mode == 'final_model' else None,
+                snapshot_state_dicts=(
+                    self.current_task_snapshot_state_dicts
+                    if rel_ref_mode == 'snapshot' else None)
             )
+            if rel_ref_mode == 'snapshot':
+                self.current_task_snapshot_state_dicts = None
         elif isinstance(self.buffer, coreset_buffer.UniformBuffer):
             self.buffer.update_buffer(
                 task_cnts=self.task_cnts,
