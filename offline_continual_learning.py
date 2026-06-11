@@ -147,6 +147,17 @@ def main(opts):
             )
         else:
             raise ValueError('Invalid runner type')
+        if opts.thirdmod_diag and (opts.thirdmod_diag_every_task or i == len(task_dic) - 1):
+            from continual_learning import thirdmod_diagnostic
+
+            thirdmod_diagnostic.run_thirdmod_diagnostic(
+                model=runner.model,
+                eval_loaders=test_loaders,
+                task_class_mapping=task_dic,
+                current_task=i,
+                buffer=runner.buffer,
+                max_samples=opts.thirdmod_diag_max_samples
+            )
         runner.next_task(dump_buffer=True)
 
 
@@ -226,6 +237,9 @@ if __name__ == '__main__':
     parser.add_argument('--snapshot_calib_lowvar_eta', type=float, default=0.02)
     parser.add_argument('--snapshot_calib_highconf_protect_q', type=float, default=0.80)
     parser.add_argument('--snapshot_verbose', action='store_true')
+    parser.add_argument('--thirdmod_diag', action='store_true')
+    parser.add_argument('--thirdmod_diag_every_task', action='store_true')
+    parser.add_argument('--thirdmod_diag_max_samples', type=int, default=1000)
     parser.add_argument('--div_lambda', type=float, default=0.1)
     parser.add_argument('--div_candidate_ratio', type=int, default=3)
     parser.add_argument('--div_feature_source', type=str, default='current_model', choices=['current_model', 'holdout_model'])

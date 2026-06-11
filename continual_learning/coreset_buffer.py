@@ -336,6 +336,25 @@ class CoresetBuffer(object):
         random.shuffle(extra_data)
         return extra_data
 
+    def get_diagnostic_counts(self):
+        """Return class/task counts without sampling or modifying the buffer."""
+        class_counts = {}
+        task_counts = {}
+        for task_id, task_data in enumerate(self.data):
+            task_counts[int(task_id)] = len(task_data)
+            for di in task_data:
+                if len(di) not in [3, 4]:
+                    raise ValueError('Invalid data length')
+                lab = di[2]
+                if isinstance(lab, torch.Tensor):
+                    lab = lab.item()
+                lab = int(lab)
+                class_counts[lab] = class_counts.get(lab, 0) + 1
+        return {
+            'class_counts': class_counts,
+            'task_counts': task_counts
+        }
+
     def get_data(self):
         for i in range(len(self.data)):
             sps = []
